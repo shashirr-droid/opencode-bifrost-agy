@@ -1,0 +1,14 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "github:shashirr-droid/opencode-bifrost-agy",
+      {
+        "bifrostUrl": "https://bifrost.example.internal",
+        "gcpLocation": "global",
+        "baicodeUserTier": "gcp-ge-plus-tier",
+        "permissionMode": "accept-edits"
+      }
+    ]
+  ]
+}

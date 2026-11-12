@@ -1,0 +1,29 @@
+{
+  "name": "opencode-bifrost-agy",
+  "version": "1.0.0",
+  "description": "Zero-daemon OpenCode plugin integrating Bifrost AI Gateway, Google Antigravity CLI (agy), and Gemini Enterprise seats with implicit cache continuity and native OpenCode permission delegation.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shashirr-droid/opencode-bifrost-agy.git"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "bifrost",
+    "antigravity",
+    "gemini-enterprise",
+    "ai-gateway"
+  ],
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.19.0"
+  }
+}

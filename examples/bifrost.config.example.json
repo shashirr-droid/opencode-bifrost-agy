@@ -1,0 +1,151 @@
+{
+  "client": {
+    "enforce_auth_on_inference": true
+  },
+  "providers": {
+    "vertex": {
+      "keys": [
+        {
+          "id": "key-vertex-primary",
+          "name": "vertex-adc",
+          "value": "",
+          "models": [
+            "gemini-2.5-flash",
+            "gemini-2.5-pro"
+          ],
+          "weight": 1.0,
+          "vertex_key_config": {
+            "project_id": "env.VERTEX_PROJECT_ID",
+            "region": "global"
+          }
+        }
+      ]
+    },
+    "anthropic": {
+      "keys": [
+        {
+          "id": "key-anthropic-primary",
+          "name": "anthropic-api",
+          "value": "env.ANTHROPIC_API_KEY",
+          "models": [
+            "claude-sonnet-4-5"
+          ],
+          "weight": 1.0
+        }
+      ]
+    },
+    "agy-cli": {
+      "custom_provider_config": {
+        "base_provider_type": "openai",
+        "allowed_requests": {
+          "list_models": true,
+          "chat_completion": true,
+          "chat_completion_stream": true
+        }
+      },
+      "network_config": {
+        "base_url": "http://127.0.0.1:8091/v1",
+        "allow_private_network": true,
+        "default_request_timeout_in_seconds": 600
+      },
+      "keys": [
+        {
+          "id": "key-agy-catalog",
+          "name": "agy-gemini-enterprise-catalog",
+          "value": "env.SHIM_SHARED_SECRET",
+          "weight": 1.0,
+          "models": [
+            "policy-routed",
+            "agy-frontier",
+            "agy-fast",
+            "agy-pro",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash"
+          ],
+          "aliases": {
+            "agy-frontier": "gemini-2.5-pro",
+            "agy-fast": "gemini-2.5-flash",
+            "agy-pro": "gemini-2.5-pro"
+          }
+        }
+      ]
+    }
+  },
+  "governance": {
+    "virtual_keys": [
+      {
+        "id": "vk-opencode-default",
+        "name": "OpenCode Standard Key (No Antigravity)",
+        "value": "env.VK_OPENCODE_DEFAULT",
+        "is_active": true,
+        "provider_configs": [
+          {
+            "provider": "vertex",
+            "weight": 1.0,
+            "allowed_models": [
+              "gemini-2.5-flash",
+              "gemini-2.5-pro"
+            ],
+            "key_ids": [
+              "*"
+            ]
+          },
+          {
+            "provider": "anthropic",
+            "weight": 1.0,
+            "allowed_models": [
+              "claude-sonnet-4-5"
+            ],
+            "key_ids": [
+              "*"
+            ]
+          }
+        ]
+      },
+      {
+        "id": "vk-opencode-agy",
+        "name": "OpenCode /agy Key (Gemini Enterprise)",
+        "value": "env.VK_OPENCODE_AGY",
+        "is_active": true,
+        "provider_configs": [
+          {
+            "provider": "agy-cli",
+            "weight": 1.0,
+            "allowed_models": [
+              "policy-routed",
+              "agy-frontier",
+              "agy-fast",
+              "agy-pro",
+              "gemini-2.5-pro",
+              "gemini-2.5-flash"
+            ],
+            "key_ids": [
+              "*"
+            ]
+          }
+        ]
+      }
+    ],
+    "routing_rules": [
+      {
+        "id": "rule-agy-global-default-model",
+        "name": "Default /agy Model Policy",
+        "enabled": true,
+        "chain_rule": false,
+        "cel_expression": "model == \"policy-routed\" || model == \"agy-cli/policy-routed\"",
+        "targets": [
+          {
+            "provider": "agy-cli",
+            "model": "gemini-2.5-flash",
+            "weight": 1.0
+          }
+        ],
+        "fallbacks": [
+          "agy-cli/gemini-2.5-flash"
+        ],
+        "scope": "global",
+        "priority": 50
+      }
+    ]
+  }
+}
