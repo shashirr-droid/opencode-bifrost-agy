@@ -26,7 +26,7 @@ This guide walks platform administrators and developers through installing and c
 | :--- | :--- | :--- |
 | **Google Cloud / Gemini Enterprise** | A Google Cloud project with **Gemini Enterprise** enabled and human developer seats assigned (`Standard` or `Plus`). | Cloud / IAM Admin |
 | **Bifrost AI Gateway** | OSS Bifrost AI Gateway running either centrally (`https://bifrost.example.internal`) or locally (`http://127.0.0.1:8080`). | Platform Admin |
-| **Developer Workstation** | **OpenCode CLI** (`v1.19.0+`), **Google Cloud SDK (`gcloud`)**, and **Antigravity CLI (`agy` `v1.5.5+`)**. | Developer |
+| **Developer Workstation** | **OpenCode CLI** (`v2.x` recommended; `v1.18.29+` / `v1.19.x` also supported), **Google Cloud SDK (`gcloud`)**, and **Antigravity CLI (`agy` `v1.5.5+`)**. | Developer |
 
 ---
 
@@ -140,57 +140,62 @@ Merge [`examples/bifrost.config.example.json`](../examples/bifrost.config.exampl
 
 ## 5. Step 4: Install & Configure the `opencode-bifrost-agy` Plugin in OpenCode
 
-The `opencode-bifrost-agy` plugin runs **in-process inside OpenCode's Bun runtime**—eliminating external Python virtual environments, `systemd`/`launchd` background services, and manual 70-line `opencode.json` provider definitions.
+The `opencode-bifrost-agy` plugin (`v2.0.0`) exports both OpenCode V2's `Plugin.define({ id: "opencode-bifrost-agy", setup(ctx) })` contract and OpenCode V1's `server()` hook, running **in-process inside OpenCode's Bun runtime** with zero external daemons.
 
-### Option A: One-Command Install + Interactive Login Wizard (`opencode auth login`)
+### Option A: One-Command Install + Interactive Login (`opencode plugin add` + `/connect`)
 
 ```bash
-# 1. Install the plugin globally into OpenCode
-opencode plugin github:shashirr-droid/opencode-bifrost-agy -g
+# 1. Install the plugin globally into OpenCode V2
+opencode plugin add github:shashirr-droid/opencode-bifrost-agy
 
-# 2. Run the interactive credential & parameter setup wizard
-opencode auth login
+# (To upgrade an existing installation to the latest commit:)
+# opencode plugin update opencode-bifrost-agy
+
+# 2. Run the interactive credential & parameter setup wizard (CLI or `/connect` in TUI)
+opencode auth login bifrost-agy
 ```
 
-Select **`Antigravity CLI (Bifrost Policy + Gemini Enterprise Plugin)`** (`bifrost-agy`) and answer the prompts:
+*(Using OpenCode V1 `1.19.x`? Run `opencode plugin github:shashirr-droid/opencode-bifrost-agy -g` followed by `opencode auth login`.)*
+
+Answer the form prompts when connecting **`Antigravity CLI (Bifrost Policy + Gemini Enterprise)`** (`bifrost-agy`):
 1. **Bifrost Gateway URL:** `https://bifrost.example.internal` *(or `http://127.0.0.1:8080` for local Bifrost)*
-2. **Bifrost Virtual Key for `/agy`:** `sk-bf-agy-...`
-3. **Bifrost Standard Virtual Key:** `sk-bf-std-...`
-4. **Gemini Enterprise GCP Quota Project ID:** *(auto-suggested from your `application_default_credentials.json`)*
-5. **Gemini Enterprise Location:** `global` | `us` | `eu`
-6. **Gemini Enterprise License Tier:** `gcp-ge-plus-tier` | `gcp-ge-standard-tier`
-7. **Headless Workspace Permission Posture:** `accept-edits` *(recommended)* | `strict`
+2. **Bifrost Standard Virtual Key:** `sk-bf-std-...` *(optional, for default non-`/agy` coding turns)*
+3. **Gemini Enterprise GCP Quota Project ID:** *(auto-suggested from your `application_default_credentials.json`)*
+4. **Gemini Enterprise Location:** `global` | `us` | `eu`
+5. **Gemini Enterprise License Tier:** `gcp-ge-plus-tier` | `gcp-ge-standard-tier`
+6. **Headless Workspace Permission Posture:** `accept-edits` *(recommended)* | `strict`
+7. **API Key (`/agy` Virtual Key):** `sk-bf-agy-...`
 
-OpenCode validates your Virtual Key against `${bifrostUrl}/v1/models` and stores credentials in `~/.local/share/opencode/auth.json` (`0600`).
+OpenCode V2 stores the credential and form metadata securely in its SQLite credential database (`~/.local/share/opencode/opencode.db`) and automatically reloads the `bifrost` and `bifrost-agy` model catalogs without restarting OpenCode.
 
-### Option B: Declarative `opencode.json` Tuple (MDM / Fleet Rollout)
+### Option B: Declarative `opencode.jsonc` / `opencode.json` (MDM / Fleet Rollout)
 
-For enterprise fleet distribution, place non-secret organization defaults directly in `~/.config/opencode/opencode.json` (see [`examples/opencode.json.example`](../examples/opencode.json.example)) while supplying Virtual Keys via `opencode auth login` or environment variables (`BIFROST_VK_DEFAULT`, `BIFROST_VK_AGY`):
+For enterprise fleet distribution on **OpenCode V2**, place non-secret organization defaults under `"plugins"` in `~/.config/opencode/opencode.jsonc` or `~/.config/opencode/opencode.json` (see [`examples/opencode.json.example`](../examples/opencode.json.example)) while supplying Virtual Keys via `/connect`, `opencode auth login bifrost-agy`, or environment variables (`BIFROST_VK_DEFAULT`, `BIFROST_VK_AGY`):
 
-```json
+```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": [
-    [
-      "github:shashirr-droid/opencode-bifrost-agy",
-      {
+  "plugins": [
+    {
+      "package": "github:shashirr-droid/opencode-bifrost-agy",
+      "options": {
         "bifrostUrl": "https://bifrost.example.internal",
         "gcpLocation": "global",
         "baicodeUserTier": "gcp-ge-plus-tier",
         "permissionMode": "accept-edits"
       }
-    ]
+    }
   ]
 }
 ```
 
-*(If installing from a local clone on a workstation without external GitHub access, replace `"github:shashirr-droid/opencode-bifrost-agy"` with `"file:///path/to/opencode-bifrost-agy"`).*
+*(If installing from a local clone on an air-gapped workstation, replace `"github:shashirr-droid/opencode-bifrost-agy"` with `"/absolute/path/to/opencode-bifrost-agy"`).*
 
 ---
 
 ## 6. Step 5: Requisite Parameters Reference
 
-Parameters are resolved in priority order: **inline `opencode.json` plugin `options`** &rarr; **`~/.local/share/opencode/auth.json` (`opencode auth login`)** &rarr; **environment variables** &rarr; **auto-detected defaults**.
+Parameters are resolved in priority order: **inline `opencode.json(c)` plugin `options`** &rarr; **saved OpenCode integration credential (`/connect` / `opencode auth login bifrost-agy`)** &rarr; **environment variables** &rarr; **auto-detected defaults**.
 
 | Parameter | Env Fallback | Default / Auto-Detection | Description |
 | :--- | :--- | :--- | :--- |
@@ -214,14 +219,14 @@ Parameters are resolved in priority order: **inline `opencode.json` plugin `opti
 ### 7.1 Run Pre-Flight Diagnostics
 
 ```bash
+# Verify active plugin registration (must list `opencode-bifrost-agy`)
+opencode plugin list
+
 # Verify saved credentials
 opencode auth list
 
-# List all dynamically discovered Bifrost + Gemini Enterprise agy models & aliases
+# List dynamically discovered Bifrost + Gemini Enterprise agy models & aliases
 opencode models
-
-# Run the built-in end-to-end health check (/agy-doctor)
-opencode run --command agy-doctor ""
 ```
 
 ### 7.2 Interactive TUI Usage (`opencode`)
@@ -234,7 +239,7 @@ opencode
 - **Type normally + `Enter`:** Uses your default Bifrost model (`bifrost/vertex/...`) with zero `agy` overhead.
 - **`/agy <prompt>`:** Executes via Antigravity CLI using Bifrost's active `policy-routed` model, scoped to `~/your-repository`, preserving `conversation_id` across follow-ups for 15 minutes (GCP implicit cache), and surfacing interactive OpenCode permission prompts (`Allow once` / `Always allow` / `Reject`) for gated tools.
 - **`/agy-frontier <prompt>` | `/agy-fast <prompt>` | `/agy-pro <prompt>`:** Routes via Bifrost's configured model aliases.
-- **`/agy-doctor`:** Displays live ADC, `agy`, `BAICODE_USER_TIER`, and Bifrost readiness inside chat.
+- **`/agy-doctor`:** Posts an instant readiness table auditing `agy`, human ADC (`authorized_user`), `BAICODE_USER_TIER`, and Bifrost connectivity directly into chat without consuming model tokens.
 
 ### 7.3 Central Day-2 Model Switching (Zero Workstation Changes)
 
@@ -246,6 +251,7 @@ To switch the active `/agy` model across every developer workstation, update `ta
 
 | Symptom | Root Cause | Resolution |
 | :--- | :--- | :--- |
+| **`Server plugin error: Plugin must export a default definition with an id and an effect or setup function`** | An earlier `v1.0.0` copy of the plugin is cached in OpenCode V2. | Run `opencode plugin update` (or `opencode plugin remove github:shashirr-droid/opencode-bifrost-agy && opencode plugin add github:shashirr-droid/opencode-bifrost-agy`) to pull `v2.0.0+`. |
 | **`/agy-doctor` reports `adc_is_human_seat: false` or `403 PERMISSION_DENIED`** | Workstation ADC is missing or bound to a GCE service account instead of a licensed human user. | Run `gcloud auth application-default login --project="<YOUR_GCP_PROJECT_ID>"` as a user granted `roles/discoveryengine.agentspaceUser`. |
 | **Usage does not appear in Gemini Enterprise > Developer tools metrics** | `baicodeUserTier` (`BAICODE_USER_TIER`) does not match the user's assigned license tier, or `AGY_USE_BAIC_FETCH_CONFIG=true` was set in the shell. | Set `baicodeUserTier` to `gcp-ge-plus-tier` or `gcp-ge-standard-tier`; the plugin automatically strips `AGY_USE_BAIC_FETCH_CONFIG` and PAYG keys. |
 | **Bifrost returns `403 policy_model_blocked` or `401`** | The `vkAgy` Virtual Key has been revoked or its `allowed_models` list excludes the requested model. | Expected Bifrost RBAC behavior. Update `vk-opencode-agy` in Bifrost Governance or select an allowed model via `/models`. |

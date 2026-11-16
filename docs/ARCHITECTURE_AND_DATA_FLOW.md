@@ -13,7 +13,7 @@ This document details the architecture of **`opencode-bifrost-agy`** and traces 
 | Component | Runtime Boundary | Core Responsibilities |
 | :--- | :--- | :--- |
 | **OpenCode CLI / TUI** | Developer Workstation | Terminal coding agent & UI. Captures user prompts, injects workspace metadata (`<env>`), executes approved local tools (`bash`, `read`, `write`, `edit`), and renders native permission modals (`Allow once` / `Always allow` / `Reject`). |
-| **`opencode-bifrost-agy` Plugin** | In-Process inside OpenCode (Bun) | Zero-daemon integration bridge. Auto-discovers models via `config(cfg)`, provides `opencode auth login` prompts, manages an ephemeral loopback listener (`Bun.serve`), maintains a **15-minute `conversation_id` cache map**, binds `agy` dynamically to the active repository (`cwd`), and translates `agy` permission denials into OpenAI `tool_calls`. |
+| **`opencode-bifrost-agy` Plugin** | In-Process inside OpenCode (Bun) | Zero-daemon V2/V1 integration bridge (`Plugin.define({ id, setup(ctx) })` + `server()`). Auto-discovers models (`ctx.provider.transform`), registers `/connect` (`opencode auth login bifrost-agy`) form prompts, manages an ephemeral loopback listener (`Bun.serve`), maintains a **15-minute `conversation_id` cache map**, binds `agy` dynamically to the active repository (`cwd`), and translates `agy` permission denials into OpenAI `tool_calls`. |
 | **Bifrost AI Gateway** | Enterprise Central VPC *or* Local Loopback | Policy control plane. Enforces **Virtual Key RBAC** (`vkDefault` vs. `vkAgy`), rate/budget limits, model allowlists, tier aliases (`agy-frontier`, `agy-fast`, `agy-pro`), and **CEL routing rules** (`policy-routed`). |
 | **Antigravity CLI (`agy`) + User ADC** | Developer Workstation Subprocess | Headless agentic CLI (`agy -p --output-format stream-json`). Authenticates against Google Cloud using the developer's personal `authorized_user` Application Default Credentials (`AGY_ADC_AUTH=true`). |
 | **Google Cloud Gemini Enterprise** | Google Cloud (`businessaicode` / `discoveryengine`) | Enforces seat-level licensing, server-side `AdminControls` (`Terminal command auto-execution policy` & `Outside of file access policy`), **5–15 minute implicit prompt caching**, and **Developer tools metrics** (`SendTelemetry`). |
@@ -24,7 +24,7 @@ This document details the architecture of **`opencode-bifrost-agy`** and traces 
 2. **Centralized Policy Governance Without Inbound Laptop Ports:**
    - **In `central-bifrost` mode** *(remote HTTPS Bifrost)*: Developer laptops sit behind NAT/VPN, so Central Bifrost never connects inbound to the workstation. Instead, the plugin binds an OS-assigned ephemeral loopback port (`127.0.0.1:<random_port>`) and makes **outbound HTTPS calls** to Central Bifrost (`GET /v1/models` and `/api/routing/rules`) to enforce Virtual Key allowlists and resolve `policy-routed` before invoking `agy` locally.
    - **In `through-bifrost` mode** *(co-located localhost Bifrost)*: OpenCode sends `/agy` requests directly through local Bifrost (`127.0.0.1:8080`), which evaluates Virtual Key + CEL policies and forwards upstream to the plugin's embedded `127.0.0.1:8091` listener—giving full gateway request/token logging with zero external Python or `systemd` services.
-3. **Zero-Daemon Lifecycle:** Because `Bun.serve()` is unref'd (`embeddedServer.unref()`) and torn down inside OpenCode's `dispose()` hook, one-shot CLI commands (`opencode run ...`) exit immediately and interactive TUI sessions leave zero orphaned background processes behind.
+3. **Zero-Daemon Lifecycle:** Because `Bun.serve()` is unref'd (`embeddedServer.unref()`) and torn down inside OpenCode's cleanup function (`setup(ctx)` return callback in V2 / `dispose()` in V1), one-shot CLI commands exit immediately and interactive TUI sessions leave zero orphaned background processes behind.
 
 ---
 
@@ -53,8 +53,8 @@ Consider a realistic developer coding task executed inside `~/payments-service`:
 
 Below is the exact six-stage data flow across every component:
 
-#### Stage 1 — Workspace & Session Capture (`chat.headers` Hook)
-1. As `/agy` triggers, OpenCode switches to `agent.agy` (`model: "bifrost-agy/agy-cli/policy-routed"`) and invokes the plugin's `"chat.headers"` hook.
+#### Stage 1 — Workspace & Session Capture (`http.request` / `chat.headers` Hook)
+1. As `/agy` triggers, OpenCode switches to the `agy` agent (`bifrost-agy/agy-cli/policy-routed`) and invokes the plugin's outbound request hook (`ctx.session.hook("http.request")` in V2 / `"chat.headers"` in V1).
 2. The plugin records OpenCode's native `sessionID` and active project directory (`~/payments-service`), attaching `x-opencode-session-id` and `x-opencode-workspace-dir` alongside OpenCode's `<env> Working directory: .../payments-service </env>` system block and client `tools[]` definitions (`bash`, `read`, `write`, `edit`).
 
 #### Stage 2 — Bifrost Virtual Key & CEL Policy Resolution

@@ -2,16 +2,16 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { tool, type Plugin } from "@opencode-ai/plugin";
+import { Agent, Integration, Model, Plugin, Provider } from "@opencode/plugin";
 
 export interface BifrostAgyPluginOptions {
-  /** Base URL of Central or Local Bifrost Gateway (e.g. "https://bifrost.internal.example.com" or "http://127.0.0.1:8080") */
+  /** Base URL of Central or Local Bifrost Gateway (e.g. "https://bifrost.example.internal" or "http://127.0.0.1:8080") */
   bifrostUrl?: string;
   /** Routing topology: "auto" | "through-bifrost" (Bifrost -> plugin) | "central-bifrost" (OpenCode -> plugin -> Central Bifrost policy check + local agy) */
   routingMode?: "auto" | "through-bifrost" | "central-bifrost";
-  /** Standard Bifrost Virtual Key (falls back to auth.json or env BIFROST_VK_DEFAULT) */
+  /** Standard Bifrost Virtual Key (falls back to saved integration credential or env BIFROST_VK_DEFAULT) */
   vkDefault?: string;
-  /** Bifrost Virtual Key authorized for /agy (falls back to auth.json or env BIFROST_VK_AGY) */
+  /** Bifrost Virtual Key authorized for /agy (falls back to saved integration credential or env BIFROST_VK_AGY) */
   vkAgy?: string;
   /** Optional Basic Auth user/password for reading Central Bifrost /api/routing/rules in central-bifrost mode */
   bifrostPolicyUser?: string;
@@ -32,7 +32,7 @@ export interface BifrostAgyPluginOptions {
   permissionMode?: "accept-edits" | "strict";
   /** Implicit cache conversation_id TTL in seconds (default 900 = 15 min) */
   conversationTtlSeconds?: number;
-  /** Comma-separated allowed workspace root prefixes */
+  /** Allowed workspace root prefixes */
   allowedWorkspaceRoots?: string[];
   /** Loopback port when routingMode is "through-bifrost" (default 8091) */
   localBridgePort?: number;
@@ -47,7 +47,7 @@ interface SessionEntry {
   turnCount: number;
 }
 
-interface StoredAuthFile {
+interface StoredLegacyAuthFile {
   [providerId: string]: {
     type?: string;
     key?: string;
@@ -55,6 +55,14 @@ interface StoredAuthFile {
   };
 }
 
+interface ExternalCredentialOverrides {
+  vkAgy?: string;
+  vkDefault?: string;
+  metadata?: Record<string, unknown>;
+}
+
+const PLUGIN_ID = "opencode-bifrost-agy";
+const PLUGIN_VERSION = "2.0.0";
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const OPENCODE_ENV_CWD_RE = /<env>[\s\S]*?Working directory:\s*([^\r\n]+)[\s\S]*?<\/env>/;
@@ -67,7 +75,9 @@ const STRIPPED_AUTH_VARS = [
 ] as const;
 
 function readAdcInfo(userHome: string): { type: string; quotaProjectId: string; path: string } {
-  const adcPath = process.env.GOOGLE_APPLICATION_CREDENTIALS || join(userHome, ".config", "gcloud", "application_default_credentials.json");
+  const adcPath =
+    process.env.GOOGLE_APPLICATION_CREDENTIALS ||
+    join(userHome, ".config", "gcloud", "application_default_credentials.json");
   if (!existsSync(adcPath)) {
     return { type: "missing", quotaProjectId: "", path: adcPath };
   }
@@ -83,11 +93,11 @@ function readAdcInfo(userHome: string): { type: string; quotaProjectId: string; 
   }
 }
 
-function readOpencodeAuth(userHome: string): StoredAuthFile {
+function readLegacyOpencodeAuth(userHome: string): StoredLegacyAuthFile {
   const authPath = join(userHome, ".local", "share", "opencode", "auth.json");
   if (!existsSync(authPath)) return {};
   try {
-    return JSON.parse(readFileSync(authPath, "utf-8")) as StoredAuthFile;
+    return JSON.parse(readFileSync(authPath, "utf-8")) as StoredLegacyAuthFile;
   } catch {
     return {};
   }
@@ -148,48 +158,25 @@ function hashPrefix(workspaceDir: string, turns: Array<[string, string]>): strin
     .digest("hex");
 }
 
-export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => {
+function strMeta(meta: Record<string, unknown> | undefined, key: string): string {
+  const v = meta?.[key];
+  return typeof v === "string" ? v.trim() : "";
+}
+
+function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string, unknown> = {}) {
   const opts = (rawOptions || {}) as BifrostAgyPluginOptions;
   const userHome = homedir();
-  const savedAuth = readOpencodeAuth(userHome);
-  const savedMeta = savedAuth["bifrost-agy"]?.metadata || {};
-  const adcInfo = readAdcInfo(userHome);
+  const legacyAuth = readLegacyOpencodeAuth(userHome);
+  const legacyMeta = legacyAuth["bifrost-agy"]?.metadata || {};
 
-  const bifrostUrl = String(
-    opts.bifrostUrl || savedMeta.bifrostUrl || process.env.BIFROST_URL || "http://127.0.0.1:8080"
-  ).replace(/\/+$/, "");
-
-  const gcpProjectId = String(
-    opts.gcpProjectId ||
-      savedMeta.gcpProjectId ||
-      process.env.GOOGLE_CLOUD_PROJECT ||
-      process.env.GOOGLE_CLOUD_QUOTA_PROJECT ||
-      adcInfo.quotaProjectId ||
-      ""
-  ).trim();
-
-  const gcpLocation = String(
-    opts.gcpLocation || savedMeta.gcpLocation || process.env.GOOGLE_CLOUD_LOCATION || "global"
-  ).trim();
-
-  const baicodeUserTier = String(
-    opts.baicodeUserTier || savedMeta.baicodeUserTier || process.env.BAICODE_USER_TIER || "gcp-ge-plus-tier"
-  ).trim();
-
-  const permissionMode = (
-    opts.permissionMode ||
-    (savedMeta.permissionMode as "accept-edits" | "strict") ||
-    (process.env.AGY_PERMISSION_MODE as "accept-edits" | "strict") ||
-    "accept-edits"
-  );
-
-  const vkAgy = String(
-    opts.vkAgy || savedAuth["bifrost-agy"]?.key || process.env.BIFROST_VK_AGY || ""
-  ).trim();
-
-  const vkDefault = String(
-    opts.vkDefault || savedMeta.vkDefault || savedAuth["bifrost"]?.key || process.env.BIFROST_VK_DEFAULT || ""
-  ).trim();
+  let bifrostUrl = "";
+  let gcpProjectId = "";
+  let gcpLocation = "global";
+  let baicodeUserTier = "gcp-ge-plus-tier";
+  let permissionMode: "accept-edits" | "strict" = "accept-edits";
+  let vkAgy = "";
+  let vkDefault = "";
+  let resolvedRoutingMode: "through-bifrost" | "central-bifrost" = "central-bifrost";
 
   const bifrostPolicyUser = String(opts.bifrostPolicyUser || process.env.BIFROST_POLICY_USER || "").trim();
   const bifrostPolicyPassword = String(opts.bifrostPolicyPassword || process.env.BIFROST_POLICY_PASSWORD || "").trim();
@@ -199,21 +186,14 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
   const shimSharedSecret = String(opts.shimSharedSecret || process.env.SHIM_SHARED_SECRET || "").trim();
   const localBridgePort = Number(opts.localBridgePort || 8091);
 
-  const isLocalBifrost = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(bifrostUrl);
-  const resolvedRoutingMode: "through-bifrost" | "central-bifrost" =
-    opts.routingMode === "through-bifrost" || opts.routingMode === "central-bifrost"
-      ? opts.routingMode
-      : isLocalBifrost
-        ? "through-bifrost"
-        : "central-bifrost";
-
   const allowedRoots = (
-    opts.allowedWorkspaceRoots ||
-    (process.env.AGY_ALLOWED_WORKSPACE_ROOTS
-      ? process.env.AGY_ALLOWED_WORKSPACE_ROOTS.split(",")
-      : [userHome, resolve(pluginInput.directory), "/tmp"])
+    Array.isArray(opts.allowedWorkspaceRoots)
+      ? opts.allowedWorkspaceRoots
+      : process.env.AGY_ALLOWED_WORKSPACE_ROOTS
+        ? process.env.AGY_ALLOWED_WORKSPACE_ROOTS.split(",")
+        : [userHome, resolve(initialDirectory), "/tmp"]
   )
-    .map((p) => p.trim())
+    .map((p) => String(p).trim())
     .filter(Boolean)
     .map((p) => resolve(p));
 
@@ -223,7 +203,81 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
   let modelCacheTs = 0;
   const vkAllowCache = new Map<string, { ts: number; allowed: Set<string> }>();
   let policyRuleCache: { ts: number; model: string } = { ts: 0, model: "" };
-  let latestActiveOpencodeDir = resolve(pluginInput.directory);
+  let latestActiveOpencodeDir = resolve(initialDirectory);
+
+  function applyCredentialOverrides(ext: ExternalCredentialOverrides = {}): void {
+    const adcInfo = readAdcInfo(userHome);
+    const meta = ext.metadata || {};
+
+    bifrostUrl = String(
+      opts.bifrostUrl ||
+        strMeta(meta, "bifrostUrl") ||
+        legacyMeta.bifrostUrl ||
+        process.env.BIFROST_URL ||
+        "http://127.0.0.1:8080"
+    ).replace(/\/+$/, "");
+
+    gcpProjectId = String(
+      opts.gcpProjectId ||
+        strMeta(meta, "gcpProjectId") ||
+        legacyMeta.gcpProjectId ||
+        process.env.GOOGLE_CLOUD_PROJECT ||
+        process.env.GOOGLE_CLOUD_QUOTA_PROJECT ||
+        adcInfo.quotaProjectId ||
+        ""
+    ).trim();
+
+    gcpLocation = String(
+      opts.gcpLocation ||
+        strMeta(meta, "gcpLocation") ||
+        legacyMeta.gcpLocation ||
+        process.env.GOOGLE_CLOUD_LOCATION ||
+        "global"
+    ).trim();
+
+    baicodeUserTier = String(
+      opts.baicodeUserTier ||
+        strMeta(meta, "baicodeUserTier") ||
+        legacyMeta.baicodeUserTier ||
+        process.env.BAICODE_USER_TIER ||
+        "gcp-ge-plus-tier"
+    ).trim();
+
+    const rawPerm = String(
+      opts.permissionMode ||
+        strMeta(meta, "permissionMode") ||
+        legacyMeta.permissionMode ||
+        process.env.AGY_PERMISSION_MODE ||
+        "accept-edits"
+    ).trim();
+    permissionMode = rawPerm === "strict" ? "strict" : "accept-edits";
+
+    vkAgy = String(
+      opts.vkAgy || ext.vkAgy || legacyAuth["bifrost-agy"]?.key || process.env.BIFROST_VK_AGY || ""
+    ).trim();
+
+    vkDefault = String(
+      opts.vkDefault ||
+        ext.vkDefault ||
+        strMeta(meta, "vkDefault") ||
+        legacyMeta.vkDefault ||
+        legacyAuth["bifrost"]?.key ||
+        process.env.BIFROST_VK_DEFAULT ||
+        ""
+    ).trim();
+
+    const isLocalBifrost = /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(bifrostUrl);
+    resolvedRoutingMode =
+      opts.routingMode === "through-bifrost" || opts.routingMode === "central-bifrost"
+        ? opts.routingMode
+        : isLocalBifrost
+          ? "through-bifrost"
+          : "central-bifrost";
+
+    vkAllowCache.clear();
+  }
+
+  applyCredentialOverrides();
 
   function buildAgyEnv(): Record<string, string> {
     const env: Record<string, string> = {};
@@ -343,15 +397,24 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
       return { ...modelCache };
     }
     const proc = Bun.spawn([agyBin, "models"], {
+      stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
       env: buildAgyEnv(),
     });
+    const killTimer = setTimeout(() => {
+      try {
+        proc.kill();
+      } catch {
+        // ignore
+      }
+    }, 10_000);
     const [stdoutTxt, stderrTxt, exitCode] = await Promise.all([
       new Response(proc.stdout).text(),
       new Response(proc.stderr).text(),
       proc.exited,
     ]);
+    clearTimeout(killTimer);
     if (exitCode !== 0) {
       throw new Error(`\`agy models\` failed (exit ${exitCode}): ${stderrTxt.trim() || stdoutTxt.trim()}`);
     }
@@ -383,6 +446,7 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
     try {
       const resp = await fetch(`${bifrostUrl}/v1/models`, {
         headers: { Authorization: `Bearer ${vk}` },
+        signal: AbortSignal.timeout(5_000),
       });
       if (!resp.ok) {
         return { status: resp.status, allowed: new Set(), error: await resp.text() };
@@ -412,6 +476,7 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
         const basic = Buffer.from(`${bifrostPolicyUser}:${bifrostPolicyPassword}`).toString("base64");
         const resp = await fetch(`${bifrostUrl}/api/routing/rules`, {
           headers: { Authorization: `Basic ${basic}` },
+          signal: AbortSignal.timeout(5_000),
         });
         if (resp.ok) {
           const raw: any = await resp.json();
@@ -585,6 +650,7 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
         return Response.json({
           status: "ok",
           runtime: "in-process-opencode-plugin",
+          version: PLUGIN_VERSION,
           routing_mode: resolvedRoutingMode,
           bifrost_url: bifrostUrl,
           project: gcpProjectId,
@@ -604,6 +670,7 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
       pruneSessions();
       return Response.json({
         runtime: "in-process-opencode-plugin",
+        version: PLUGIN_VERSION,
         routing_mode: resolvedRoutingMode,
         active_cached_sessions: sessionMap.size,
         count: auditRing.length,
@@ -653,11 +720,15 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
           );
         }
       } else {
-        // central-bifrost mode: verify caller Virtual Key + CEL rule outbound against Central Bifrost
         const callerVk = bearerToken || vkAgy;
         if (!callerVk) {
           return Response.json(
-            { error: { message: "Missing Bifrost Virtual Key (`opencode auth login` or `vkAgy`).", type: "PluginAuthError" } },
+            {
+              error: {
+                message: "Missing Bifrost Virtual Key. Run `/connect` (`opencode auth login bifrost-agy`) or set `BIFROST_VK_AGY`.",
+                type: "PluginAuthError",
+              },
+            },
             { status: 401 }
           );
         }
@@ -829,7 +900,6 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
         });
       }
 
-      // Streaming SSE path
       const encoder = new TextEncoder();
       const sseStream = new ReadableStream<Uint8Array>({
         async start(controller) {
@@ -1030,7 +1100,7 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
         headers: {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
+          Connection: "keep-alive",
           "x-agy-runtime": "in-process-opencode-plugin",
           "x-agy-conversation-resumed": String(Boolean(resumedConvoId)),
         },
@@ -1040,7 +1110,6 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
     return Response.json({ error: { message: `Not found: ${path}` } }, { status: 404 });
   }
 
-  // Start embedded loopback server inside OpenCode's Bun runtime (port 8091 for through-bifrost, ephemeral port 0 for central-bifrost)
   const desiredPort = resolvedRoutingMode === "through-bifrost" ? localBridgePort : 0;
   let embeddedServer: ReturnType<typeof Bun.serve> | null = null;
   try {
@@ -1051,7 +1120,6 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
       fetch: handleBridgeRequest,
     });
   } catch {
-    // If port 8091 is already bound by another OpenCode window, bind an ephemeral port cleanly
     embeddedServer = Bun.serve({
       hostname: "127.0.0.1",
       port: 0,
@@ -1061,51 +1129,185 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
   }
   embeddedServer.unref();
 
+  async function discoverInventories() {
+    const standardModels: Record<string, string> = {};
+    if (vkDefault) {
+      try {
+        const r = await fetch(`${bifrostUrl}/v1/models`, {
+          headers: { Authorization: `Bearer ${vkDefault}` },
+          signal: AbortSignal.timeout(5_000),
+        });
+        if (r.ok) {
+          const data = (await r.json()) as { data?: Array<{ id?: string }> };
+          for (const m of data.data || []) {
+            const id = String(m?.id || "");
+            if (id && !id.startsWith("agy-cli/")) {
+              standardModels[id] = `${id} (Bifrost)`;
+            }
+          }
+        }
+      } catch {
+        // Non-fatal during offline startup
+      }
+    }
+
+    const agyModels: Record<string, string> = {
+      "agy-cli/policy-routed": "Antigravity CLI — Bifrost Policy-Configured Model (Gemini Enterprise)",
+    };
+    const discoveredAliases: string[] = [];
+    try {
+      const liveAgyCatalog = await discoverAgyModels(false);
+      let allowedSet: Set<string> | null = null;
+      if (vkAgy) {
+        const check = await validateCentralVirtualKey(vkAgy);
+        if (check.status === 200 && check.allowed.size > 0 && !check.allowed.has("*")) {
+          allowedSet = check.allowed;
+          for (const slug of check.allowed) {
+            if (!liveAgyCatalog[slug] && slug !== "policy-routed" && slug !== "*") {
+              agyModels[`agy-cli/${slug}`] = `Antigravity CLI — Bifrost Alias '${slug}' (Gemini Enterprise)`;
+              if (slug.startsWith("agy-")) {
+                discoveredAliases.push(slug);
+              }
+            }
+          }
+        }
+      }
+      for (const [slug, displayName] of Object.entries(liveAgyCatalog)) {
+        if (!allowedSet || allowedSet.has(slug)) {
+          agyModels[`agy-cli/${slug}`] = `Antigravity — ${displayName} (Gemini Enterprise)`;
+        }
+      }
+    } catch {
+      // Keep policy-routed registered even before ADC login so /agy-doctor is always available
+    }
+
+    const agyBaseUrl =
+      resolvedRoutingMode === "through-bifrost"
+        ? `${bifrostUrl}/v1`
+        : `http://127.0.0.1:${embeddedServer?.port}/v1`;
+
+    return { standardModels, agyModels, discoveredAliases, agyBaseUrl };
+  }
+
+  async function runDoctor(activeWorkspace: string) {
+    const currentAdc = readAdcInfo(userHome);
+    let agyVersion = "unavailable";
+    let modelCount = 0;
+    try {
+      const vProc = Bun.spawn([agyBin, "--version"], { stdout: "pipe", stderr: "pipe" });
+      agyVersion = (await new Response(vProc.stdout).text()).trim();
+      const cat = await discoverAgyModels(true);
+      modelCount = Object.keys(cat).length;
+    } catch (e: any) {
+      agyVersion = `error: ${e?.message || e}`;
+    }
+    const vkStatus = vkAgy
+      ? await validateCentralVirtualKey(vkAgy)
+      : { status: 0, allowed: new Set<string>(), error: "vkAgy unset" };
+    return {
+      plugin_runtime: `${PLUGIN_ID}@${PLUGIN_VERSION} (in-process, zero external daemons)`,
+      routing_mode: resolvedRoutingMode,
+      embedded_bridge_port: embeddedServer?.port || null,
+      active_workspace: activeWorkspace,
+      agy_bin: agyBin,
+      agy_version: agyVersion,
+      live_agy_models_discovered: modelCount,
+      adc_type: currentAdc.type,
+      adc_is_human_seat: currentAdc.type === "authorized_user",
+      gcp_project_id: gcpProjectId,
+      gcp_location: gcpLocation,
+      baicode_user_tier: baicodeUserTier,
+      permission_mode: permissionMode,
+      bifrost_url: bifrostUrl,
+      bifrost_vk_agy_http_status: vkStatus.status,
+      bifrost_allowed_agy_models: vkStatus.allowed.size,
+      active_cached_conversations: sessionMap.size,
+    };
+  }
+
+  function stopServer() {
+    if (embeddedServer) {
+      embeddedServer.stop(true);
+      embeddedServer = null;
+    }
+  }
+
+  return {
+    opts,
+    userHome,
+    getState: () => ({
+      bifrostUrl,
+      gcpProjectId,
+      gcpLocation,
+      baicodeUserTier,
+      permissionMode,
+      vkAgy,
+      vkDefault,
+      resolvedRoutingMode,
+      embeddedPort: embeddedServer?.port || null,
+    }),
+    setLatestWorkspace: (dir: string) => {
+      latestActiveOpencodeDir = resolve(dir);
+    },
+    applyCredentialOverrides,
+    discoverInventories,
+    runDoctor,
+    stopServer,
+  };
+}
+
+/**
+ * OpenCode V1 legacy server hook (`1.18.29` / `1.19.x` compatibility)
+ */
+export async function BifrostAgyPlugin(
+  pluginInput: { directory: string },
+  rawOptions: BifrostAgyPluginOptions = {}
+) {
+  const runtime = createBridgeRuntime(pluginInput.directory, rawOptions as Record<string, unknown>);
+  const adcInfo = readAdcInfo(runtime.userHome);
+
   return {
     dispose: async () => {
-      if (embeddedServer) {
-        embeddedServer.stop(true);
-        embeddedServer = null;
-      }
+      runtime.stopServer();
     },
 
     auth: {
       provider: "bifrost-agy",
       methods: [
         {
-          type: "api",
+          type: "api" as const,
           label: "Configure Bifrost Gateway + Gemini Enterprise Seat",
           prompts: [
             {
-              type: "text",
+              type: "text" as const,
               key: "bifrostUrl",
               message: "Bifrost Gateway URL",
-              placeholder: "https://bifrost.internal.example.com (or http://127.0.0.1:8080)",
-              validate: (v) => (/^https?:\/\/.+/.test(v.trim()) ? undefined : "Enter a valid http:// or https:// URL"),
+              placeholder: "https://bifrost.example.internal (or http://127.0.0.1:8080)",
+              validate: (v: string) => (/^https?:\/\/.+/.test(v.trim()) ? undefined : "Enter a valid http:// or https:// URL"),
             },
             {
-              type: "text",
+              type: "text" as const,
               key: "vkAgy",
               message: "Bifrost Virtual Key for /agy (Gemini Enterprise)",
               placeholder: "sk-bf-agy-...",
-              validate: (v) => (v.trim().length > 3 ? undefined : "Required"),
+              validate: (v: string) => (v.trim().length > 3 ? undefined : "Required"),
             },
             {
-              type: "text",
+              type: "text" as const,
               key: "vkDefault",
               message: "Bifrost Standard Virtual Key (for default coding turns)",
-              placeholder: "sk-bf-oc-...",
-              validate: (v) => (v.trim().length > 3 ? undefined : "Required"),
+              placeholder: "sk-bf-std-...",
+              validate: (v: string) => (v.trim().length > 3 ? undefined : "Required"),
             },
             {
-              type: "text",
+              type: "text" as const,
               key: "gcpProjectId",
               message: "Gemini Enterprise GCP Quota Project ID",
               placeholder: adcInfo.quotaProjectId || "your-gcp-project-id",
-              validate: (v) => (v.trim().length > 2 ? undefined : "Required"),
+              validate: (v: string) => (v.trim().length > 2 ? undefined : "Required"),
             },
             {
-              type: "select",
+              type: "select" as const,
               key: "gcpLocation",
               message: "Gemini Enterprise Location",
               options: [
@@ -1115,7 +1317,7 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
               ],
             },
             {
-              type: "select",
+              type: "select" as const,
               key: "baicodeUserTier",
               message: "Gemini Enterprise License Tier (for Developer Tools Metrics)",
               options: [
@@ -1124,17 +1326,20 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
               ],
             },
             {
-              type: "select",
+              type: "select" as const,
               key: "permissionMode",
               message: "Headless Antigravity Workspace Permission Posture",
               options: [
-                { label: "accept-edits (Recommended — edits allowed in repo; bash & external reads prompt in OpenCode)", value: "accept-edits" },
+                {
+                  label: "accept-edits (Recommended — edits allowed in repo; bash & external reads prompt in OpenCode)",
+                  value: "accept-edits",
+                },
                 { label: "strict (Prompt in OpenCode for file writes, bash, and external reads)", value: "strict" },
               ],
             },
           ],
-          authorize: async (inputs = {}) => {
-            const url = String(inputs.bifrostUrl || bifrostUrl).replace(/\/+$/, "");
+          authorize: async (inputs: Record<string, string> = {}) => {
+            const url = String(inputs.bifrostUrl || runtime.getState().bifrostUrl).replace(/\/+$/, "");
             const key = String(inputs.vkAgy || "").trim();
             const res = await fetch(`${url}/v1/models`, {
               headers: { Authorization: `Bearer ${key}` },
@@ -1160,102 +1365,49 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
       ],
     },
 
-    config: async (cfg) => {
+    config: async (cfg: any) => {
       cfg.provider = cfg.provider || {};
       cfg.agent = cfg.agent || {};
       cfg.command = cfg.command || {};
 
-      // 1. Discover standard Bifrost models dynamically using vkDefault
-      const standardModels: Record<string, { name: string }> = {};
-      if (vkDefault) {
-        try {
-          const r = await fetch(`${bifrostUrl}/v1/models`, {
-            headers: { Authorization: `Bearer ${vkDefault}` },
-          });
-          if (r.ok) {
-            const data = (await r.json()) as { data?: Array<{ id?: string }> };
-            for (const m of data.data || []) {
-              const id = String(m?.id || "");
-              if (id && !id.startsWith("agy-cli/")) {
-                standardModels[id] = { name: `${id} (Bifrost)` };
-              }
-            }
-          }
-        } catch {
-          // Non-fatal during offline startup
-        }
-      }
+      const inv = await runtime.discoverInventories();
+      const st = runtime.getState();
 
-      if (vkDefault || Object.keys(standardModels).length > 0) {
+      if (st.vkDefault || Object.keys(inv.standardModels).length > 0) {
+        const stdModelsObj: Record<string, { name: string }> = {};
+        for (const [id, name] of Object.entries(inv.standardModels)) {
+          stdModelsObj[id] = { name };
+        }
         cfg.provider["bifrost"] = {
           npm: "@ai-sdk/openai-compatible",
           name: "Bifrost AI Gateway",
           options: {
-            baseURL: `${bifrostUrl}/v1`,
-            apiKey: vkDefault || "{env:BIFROST_VK_DEFAULT}",
+            baseURL: `${st.bifrostUrl}/v1`,
+            apiKey: st.vkDefault || "{env:BIFROST_VK_DEFAULT}",
           },
-          models: standardModels,
-        } as any;
-
-        const firstStdId = Object.keys(standardModels)[0];
-        const firstStdModel = opts.defaultCodingModel || (firstStdId ? `bifrost/${firstStdId}` : undefined);
+          models: stdModelsObj,
+        };
+        const firstStdId = Object.keys(inv.standardModels)[0];
+        const firstStdModel = runtime.opts.defaultCodingModel || (firstStdId ? `bifrost/${firstStdId}` : undefined);
         if (firstStdModel && !cfg.model) {
           cfg.model = firstStdModel;
           cfg.small_model = cfg.small_model || firstStdModel;
         }
       }
 
-      // 2. Discover live Antigravity CLI models + Bifrost aliases & intersect with vkAgy allowlist
-      const agyModelsConfig: Record<string, { name: string }> = {
-        "agy-cli/policy-routed": {
-          name: "Antigravity CLI — Bifrost Policy-Configured Model (Gemini Enterprise)",
-        },
-      };
-      const discoveredAliases: string[] = [];
-      try {
-        const liveAgyCatalog = await discoverAgyModels(false);
-        let allowedSet: Set<string> | null = null;
-        if (vkAgy) {
-          const check = await validateCentralVirtualKey(vkAgy);
-          if (check.status === 200 && check.allowed.size > 0 && !check.allowed.has("*")) {
-            allowedSet = check.allowed;
-            for (const slug of check.allowed) {
-              if (!liveAgyCatalog[slug] && slug !== "policy-routed" && slug !== "*") {
-                agyModelsConfig[`agy-cli/${slug}`] = {
-                  name: `Antigravity CLI — Bifrost Alias '${slug}' (Gemini Enterprise)`,
-                };
-                if (slug.startsWith("agy-")) {
-                  discoveredAliases.push(slug);
-                }
-              }
-            }
-          }
-        }
-        for (const [slug, displayName] of Object.entries(liveAgyCatalog)) {
-          if (!allowedSet || allowedSet.has(slug)) {
-            agyModelsConfig[`agy-cli/${slug}`] = {
-              name: `Antigravity — ${displayName} (Gemini Enterprise)`,
-            };
-          }
-        }
-      } catch {
-        // Keep policy-routed registered even if ADC login hasn't been completed yet so /agy-doctor works
+      const agyModelsObj: Record<string, { name: string }> = {};
+      for (const [id, name] of Object.entries(inv.agyModels)) {
+        agyModelsObj[id] = { name };
       }
-
-      const agyBaseUrl =
-        resolvedRoutingMode === "through-bifrost" && embeddedServer?.port === localBridgePort
-          ? `${bifrostUrl}/v1`
-          : `http://127.0.0.1:${embeddedServer?.port}/v1`;
-
       cfg.provider["bifrost-agy"] = {
         npm: "@ai-sdk/openai-compatible",
         name: "Antigravity CLI (Bifrost Policy + Gemini Enterprise Plugin)",
         options: {
-          baseURL: agyBaseUrl,
-          apiKey: vkAgy || "{env:BIFROST_VK_AGY}",
+          baseURL: inv.agyBaseUrl,
+          apiKey: st.vkAgy || "{env:BIFROST_VK_AGY}",
         },
-        models: agyModelsConfig,
-      } as any;
+        models: agyModelsObj,
+      };
 
       cfg.enabled_providers = Array.from(new Set([...(cfg.enabled_providers || []), "bifrost", "bifrost-agy"]));
 
@@ -1264,7 +1416,7 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
           ...(cfg.model ? { model: cfg.model } : {}),
           permission: { antigravity: "deny" },
           ...(cfg.agent[stdAgent] || {}),
-        } as any;
+        };
       }
 
       cfg.agent["agy"] = {
@@ -1273,7 +1425,7 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
         model: "bifrost-agy/agy-cli/policy-routed",
         permission: { antigravity: "allow" },
         ...(cfg.agent["agy"] || {}),
-      } as any;
+      };
 
       cfg.command["agy"] = {
         description: "Execute via Antigravity CLI using Bifrost's active model policy (Gemini Enterprise)",
@@ -1281,73 +1433,415 @@ export const BifrostAgyPlugin: Plugin = async (pluginInput, rawOptions = {}) => 
         model: "bifrost-agy/agy-cli/policy-routed",
         template: "$ARGUMENTS",
         ...(cfg.command["agy"] || {}),
-      } as any;
+      };
 
-      for (const alias of discoveredAliases) {
+      for (const alias of inv.discoveredAliases) {
         cfg.command[alias] = {
           description: `Execute via Antigravity CLI using Bifrost alias '${alias}' (Gemini Enterprise)`,
           agent: "agy",
           model: `bifrost-agy/agy-cli/${alias}`,
           template: "$ARGUMENTS",
           ...(cfg.command[alias] || {}),
-        } as any;
+        };
       }
 
       cfg.command["agy-doctor"] = {
         description: "Verify Antigravity CLI, Gemini Enterprise ADC seat, BAICODE_USER_TIER, and Bifrost Gateway connectivity",
         template: "Call the `agy_doctor` tool and present a concise readiness table.",
-      } as any;
+      };
     },
 
-    "chat.headers": async (input, output) => {
-      latestActiveOpencodeDir = resolve(pluginInput.directory);
+    "chat.headers": async (input: { sessionID: string }, output: { headers: Record<string, string> }) => {
+      runtime.setLatestWorkspace(pluginInput.directory);
       output.headers["x-opencode-session-id"] = input.sessionID;
-      output.headers["x-opencode-workspace-dir"] = latestActiveOpencodeDir;
+      output.headers["x-opencode-workspace-dir"] = resolve(pluginInput.directory);
     },
 
     tool: {
-      agy_doctor: tool({
+      agy_doctor: {
         description:
           "Runs a live preflight check across Antigravity CLI (`agy`), Google Cloud human ADC (`authorized_user`), Gemini Enterprise `BAICODE_USER_TIER`, and Bifrost Gateway Virtual Key RBAC.",
         args: {},
-        async execute(_args, context) {
-          const currentAdc = readAdcInfo(userHome);
-          let agyVersion = "unavailable";
-          let modelCount = 0;
-          try {
-            const vProc = Bun.spawn([agyBin, "--version"], { stdout: "pipe", stderr: "pipe" });
-            agyVersion = (await new Response(vProc.stdout).text()).trim();
-            const cat = await discoverAgyModels(true);
-            modelCount = Object.keys(cat).length;
-          } catch (e: any) {
-            agyVersion = `error: ${e?.message || e}`;
-          }
-          const vkStatus = vkAgy ? await validateCentralVirtualKey(vkAgy) : { status: 0, allowed: new Set<string>(), error: "vkAgy unset" };
-          return JSON.stringify(
-            {
-              plugin_runtime: "opencode-bifrost-agy@1.0.0 (in-process, zero external daemons)",
-              routing_mode: resolvedRoutingMode,
-              embedded_bridge_port: embeddedServer?.port || null,
-              active_workspace: context.directory,
-              agy_bin: agyBin,
-              agy_version: agyVersion,
-              live_agy_models_discovered: modelCount,
-              adc_type: currentAdc.type,
-              adc_is_human_seat: currentAdc.type === "authorized_user",
-              gcp_project_id: gcpProjectId,
-              gcp_location: gcpLocation,
-              baicode_user_tier: baicodeUserTier,
-              permission_mode: permissionMode,
-              bifrost_url: bifrostUrl,
-              bifrost_vk_agy_http_status: vkStatus.status,
-              bifrost_allowed_agy_models: vkStatus.allowed.size,
-              active_cached_conversations: sessionMap.size,
-            },
-            null,
-            2
-          );
+        async execute(_args: Record<string, never>, context: { directory: string }) {
+          const report = await runtime.runDoctor(context.directory);
+          return JSON.stringify(report, null, 2);
         },
-      }),
+      },
     },
   };
+}
+
+function formatDoctorMarkdown(report: Record<string, unknown>): string {
+  const rows = [
+    ["Plugin Runtime", `\`${report.plugin_runtime}\``],
+    ["Routing Mode", `\`${report.routing_mode}\` (port \`${report.embedded_bridge_port}\`)`],
+    ["Active Workspace", `\`${report.active_workspace}\``],
+    ["Antigravity CLI (`agy`)", `\`${report.agy_bin}\` — \`${report.agy_version}\``],
+    ["Live `agy models` Discovered", `\`${report.live_agy_models_discovered}\``],
+    ["Human ADC Seat (`authorized_user`)", `\`${report.adc_is_human_seat}\` (\`${report.adc_type}\`)`],
+    ["Gemini Enterprise Project / Location", `\`${report.gcp_project_id || "(unset)"}\` / \`${report.gcp_location}\``],
+    ["`BAICODE_USER_TIER` (Metrics)", `\`${report.baicode_user_tier}\``],
+    ["Permission Mode", `\`${report.permission_mode}\``],
+    ["Bifrost Gateway URL", `\`${report.bifrost_url}\``],
+    ["Bifrost `/agy` VK Status", `HTTP \`${report.bifrost_vk_agy_http_status}\` (\`${report.bifrost_allowed_agy_models}\` allowed models)`],
+    ["Cached `agy` Conversations (15m TTL)", `\`${report.active_cached_conversations}\``],
+  ];
+  const lines = [
+    "### `opencode-bifrost-agy` Readiness Report",
+    "",
+    "| Check | Value |",
+    "| :--- | :--- |",
+    ...rows.map(([k, v]) => `| **${k}** | ${v} |`),
+  ];
+  return lines.join("\n");
+}
+
+/**
+ * Dual OpenCode V2 (`Plugin.define({ id, setup(ctx) })`) + OpenCode V1 (`server()`) default export.
+ */
+export default {
+  ...Plugin.define({
+    id: PLUGIN_ID,
+    async setup(ctx) {
+      const runtime = createBridgeRuntime(ctx.location.directory, ctx.options);
+      const adcInfo = readAdcInfo(runtime.userHome);
+      const initialState = runtime.getState();
+
+      // 1. Register Integrations for `/connect` & `opencode auth login bifrost-agy`
+      await ctx.integration.transform((editor) => {
+        editor.update("bifrost-agy", (integration) => {
+          integration.name = "Antigravity CLI (Bifrost Policy + Gemini Enterprise)";
+        });
+        editor.method.update({
+          integrationID: "bifrost-agy",
+          method: {
+            type: "key",
+            label: "Configure Bifrost Gateway + Gemini Enterprise Seat (/agy Virtual Key)",
+            form: [
+              {
+                type: "string",
+                key: "bifrostUrl",
+                title: "Bifrost Gateway URL",
+                placeholder: "https://bifrost.example.internal (or http://127.0.0.1:8080)",
+                default: initialState.bifrostUrl,
+                pattern: "^https?://\\S+$",
+                required: true,
+              },
+              {
+                type: "string",
+                key: "vkDefault",
+                title: "Bifrost Standard Virtual Key (optional, for default non-agy coding models)",
+                placeholder: "sk-bf-std-...",
+              },
+              {
+                type: "string",
+                key: "gcpProjectId",
+                title: "Gemini Enterprise GCP Quota Project ID",
+                placeholder: adcInfo.quotaProjectId || "your-gcp-project-id",
+                ...(initialState.gcpProjectId ? { default: initialState.gcpProjectId } : {}),
+              },
+              {
+                type: "string",
+                key: "gcpLocation",
+                title: "Gemini Enterprise Location",
+                default: initialState.gcpLocation,
+                options: [
+                  { label: "global (Default)", value: "global" },
+                  { label: "us (Multi-region)", value: "us" },
+                  { label: "eu (Multi-region)", value: "eu" },
+                ],
+              },
+              {
+                type: "string",
+                key: "baicodeUserTier",
+                title: "Gemini Enterprise License Tier (Developer Tools Metrics)",
+                default: initialState.baicodeUserTier,
+                options: [
+                  { label: "Gemini Enterprise Plus (gcp-ge-plus-tier)", value: "gcp-ge-plus-tier" },
+                  { label: "Gemini Enterprise Standard (gcp-ge-standard-tier)", value: "gcp-ge-standard-tier" },
+                ],
+              },
+              {
+                type: "string",
+                key: "permissionMode",
+                title: "Headless Antigravity Workspace Permission Posture",
+                default: initialState.permissionMode,
+                options: [
+                  {
+                    label: "accept-edits (Recommended — edits allowed in repo; bash & external reads prompt in OpenCode)",
+                    value: "accept-edits",
+                  },
+                  { label: "strict (Prompt in OpenCode for file writes, bash, and external reads)", value: "strict" },
+                ],
+              },
+            ],
+          },
+        });
+        editor.method.update({
+          integrationID: "bifrost-agy",
+          method: {
+            type: "env",
+            names: ["BIFROST_VK_AGY"],
+          },
+        });
+
+        editor.update("bifrost", (integration) => {
+          integration.name = "Bifrost AI Gateway (Standard Coding Models)";
+        });
+        editor.method.update({
+          integrationID: "bifrost",
+          method: {
+            type: "key",
+            label: "Bifrost Standard Virtual Key",
+          },
+        });
+        editor.method.update({
+          integrationID: "bifrost",
+          method: {
+            type: "env",
+            names: ["BIFROST_VK_DEFAULT"],
+          },
+        });
+      });
+
+      const bifrostProviderID = Provider.ID.make("bifrost");
+      const bifrostAgyProviderID = Provider.ID.make("bifrost-agy");
+
+      const currentSource: {
+        standardModels: Model.Info[];
+        agyModels: Model.Info[];
+        discoveredAliases: string[];
+        agyBaseUrl: string;
+      } = {
+        standardModels: [],
+        agyModels: [],
+        discoveredAliases: [],
+        agyBaseUrl: `http://127.0.0.1:${initialState.embeddedPort}/v1`,
+      };
+
+      const syncCredentialsAndInventories = async () => {
+        const agyConn = await ctx.integration.connection.active("bifrost-agy").catch(() => undefined);
+        const agyCred = agyConn ? await ctx.integration.connection.resolve(agyConn).catch(() => undefined) : undefined;
+
+        const stdConn = await ctx.integration.connection.active("bifrost").catch(() => undefined);
+        const stdCred = stdConn ? await ctx.integration.connection.resolve(stdConn).catch(() => undefined) : undefined;
+
+        runtime.applyCredentialOverrides({
+          vkAgy: agyCred?.type === "key" ? agyCred.key : undefined,
+          vkDefault: stdCred?.type === "key" ? stdCred.key : undefined,
+          metadata: agyCred?.metadata,
+        });
+
+        const inv = await runtime.discoverInventories();
+        currentSource.agyBaseUrl = inv.agyBaseUrl;
+        currentSource.discoveredAliases = inv.discoveredAliases;
+
+        currentSource.standardModels = Object.entries(inv.standardModels).map(([id, name]) => ({
+          ...Model.Info.default(bifrostProviderID, Model.ID.make(id)),
+          name,
+        }));
+
+        currentSource.agyModels = Object.entries(inv.agyModels).map(([id, name]) => ({
+          ...Model.Info.default(bifrostAgyProviderID, Model.ID.make(id)),
+          name,
+          capabilities: {
+            tools: true,
+            input: ["text", "image"],
+            output: ["text"],
+          },
+          limit: {
+            context: 1_000_000,
+            output: 65_536,
+          },
+        }));
+      };
+
+      await syncCredentialsAndInventories();
+
+      // 2. Register Providers & Models (`bifrost` + `bifrost-agy`)
+      await ctx.provider.transform((editor) => {
+        const st = runtime.getState();
+
+        if (st.vkDefault || currentSource.standardModels.length > 0) {
+          editor.add({
+            info: {
+              ...Provider.Info.empty(bifrostProviderID),
+              integrationID: Integration.ID.make("bifrost"),
+              name: "Bifrost AI Gateway",
+              activation: "enabled",
+              package: "@opencode/ai/providers/openai-compatible",
+              settings: {
+                baseURL: `${st.bifrostUrl}/v1`,
+                ...(st.vkDefault ? { apiKey: st.vkDefault } : {}),
+                encoding: "none",
+              },
+            },
+            models: currentSource.standardModels,
+          });
+        }
+
+        editor.add({
+          info: {
+            ...Provider.Info.empty(bifrostAgyProviderID),
+            integrationID: Integration.ID.make("bifrost-agy"),
+            name: "Antigravity CLI (Bifrost Policy + Gemini Enterprise Plugin)",
+            activation: "enabled",
+            package: "@opencode/ai/providers/openai-compatible",
+            settings: {
+              baseURL: currentSource.agyBaseUrl,
+              ...(st.vkAgy ? { apiKey: st.vkAgy } : {}),
+              encoding: "none",
+              headerTimeout: 600_000,
+              chunkTimeout: 900_000,
+            },
+            headers: {
+              "x-opencode-workspace-dir": ctx.location.directory,
+            },
+          },
+          models: currentSource.agyModels,
+        });
+      });
+
+      await ctx.model.transform((editor) => {
+        if (!editor.default.get()) {
+          if (runtime.opts.defaultCodingModel && runtime.opts.defaultCodingModel.includes("/")) {
+            const idx = runtime.opts.defaultCodingModel.indexOf("/");
+            editor.default.set(
+              runtime.opts.defaultCodingModel.slice(0, idx),
+              runtime.opts.defaultCodingModel.slice(idx + 1)
+            );
+          } else if (currentSource.standardModels.length > 0) {
+            editor.default.set("bifrost", currentSource.standardModels[0].id);
+          }
+        }
+      });
+
+      // 3. Register `agy` Agent
+      await ctx.agent.transform((editor) => {
+        editor.update("agy", (agent) => {
+          agent.name = Agent.Name.make("agy");
+          agent.description = "Policy-governed Antigravity CLI agent via Gemini Enterprise (Zero-Daemon Plugin)";
+          agent.mode = "all";
+          agent.hidden = false;
+          agent.model = {
+            providerID: bifrostAgyProviderID,
+            id: Model.ID.make("agy-cli/policy-routed"),
+          };
+        });
+      });
+
+      // 4. Register Slash Commands (`/agy`, `/agy-*` aliases, and `/agy-doctor`)
+      await ctx.command.transform((editor) => {
+        const registerAgyCommand = (cmdName: string, modelId: string, description: string) => {
+          editor.add({
+            name: cmdName,
+            description,
+            execute: async ({ sessionID, prompt, delivery }) => {
+              await ctx.session.switchAgent({ sessionID, agent: Agent.ID.make("agy") });
+              await ctx.session.switchModel({
+                sessionID,
+                model: {
+                  providerID: bifrostAgyProviderID,
+                  id: Model.ID.make(modelId),
+                },
+              });
+              await ctx.session.prompt({
+                ...prompt,
+                sessionID,
+                text: prompt.text || "Summarize the current workspace and confirm readiness.",
+                delivery,
+              });
+            },
+          });
+        };
+
+        registerAgyCommand(
+          "agy",
+          "agy-cli/policy-routed",
+          "Execute via Antigravity CLI using Bifrost's active model policy (Gemini Enterprise)"
+        );
+
+        for (const alias of currentSource.discoveredAliases) {
+          registerAgyCommand(
+            alias,
+            `agy-cli/${alias}`,
+            `Execute via Antigravity CLI using Bifrost alias '${alias}' (Gemini Enterprise)`
+          );
+        }
+
+        editor.add({
+          name: "agy-doctor",
+          description: "Verify Antigravity CLI, Gemini Enterprise ADC seat, BAICODE_USER_TIER, and Bifrost Gateway connectivity",
+          execute: async ({ sessionID }) => {
+            const report = await runtime.runDoctor(ctx.location.directory);
+            await ctx.session.synthetic({
+              sessionID,
+              text: formatDoctorMarkdown(report),
+              description: "Antigravity + Bifrost + Gemini Enterprise Diagnostics",
+            });
+          },
+        });
+      });
+
+      // 5. Register `agy_doctor` Tool
+      await ctx.tool.transform((editor) => {
+        editor.add({
+          name: "agy_doctor",
+          description:
+            "Runs a live preflight check across Antigravity CLI (`agy`), Google Cloud human ADC (`authorized_user`), Gemini Enterprise `BAICODE_USER_TIER`, and Bifrost Gateway Virtual Key RBAC.",
+          input: {
+            type: "object",
+            properties: {},
+            additionalProperties: false,
+          },
+          async execute() {
+            const report = await runtime.runDoctor(ctx.location.directory);
+            return { content: JSON.stringify(report, null, 2) };
+          },
+        });
+      });
+
+      // 6. Attach Session & Workspace Headers on Outbound HTTP Calls to `bifrost-agy`
+      await ctx.session.hook(
+        "http.request",
+        (event) => {
+          runtime.setLatestWorkspace(ctx.location.directory);
+          event.request.headers.set("x-opencode-session-id", event.sessionID);
+          event.request.headers.set("x-opencode-workspace-dir", ctx.location.directory);
+        },
+        { providerID: "bifrost-agy" }
+      );
+
+      // 7. Auto-reload Inventories When User Connects / Switches Credentials via `/connect` or `opencode auth`
+      const eventAbort = new AbortController();
+      void (async () => {
+        try {
+          for await (const evt of ctx.event.subscribe({
+            types: ["credential.updated", "credential.switched"],
+            signal: eventAbort.signal,
+          })) {
+            const intId = String((evt as any)?.data?.integrationID || "");
+            if (intId === "bifrost-agy" || intId === "bifrost") {
+              await syncCredentialsAndInventories();
+              await Promise.all([
+                ctx.provider.reload(),
+                ctx.model.reload(),
+                ctx.agent.reload(),
+                ctx.command.reload(),
+              ]);
+            }
+          }
+        } catch {
+          // Aborted on plugin unload
+        }
+      })();
+
+      return () => {
+        eventAbort.abort();
+        runtime.stopServer();
+      };
+    },
+  }),
+
+  server: BifrostAgyPlugin,
 };
