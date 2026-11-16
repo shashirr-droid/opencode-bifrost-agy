@@ -2,7 +2,46 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { Agent, Integration, Model, Plugin, Provider } from "@opencode/plugin";
+import type { Agent, Integration, Model, Plugin, Provider } from "@opencode/plugin";
+
+const makeProviderID = (id: string) => id as Provider.ID;
+const makeModelID = (id: string) => id as Model.ID;
+const makeAgentID = (id: string) => id as Agent.ID;
+const makeAgentName = (name: string) => name as Agent.Name;
+const makeIntegrationID = (id: string) => id as Integration.ID;
+
+function makeEmptyProviderInfo(id: Provider.ID): Provider.Info {
+  return {
+    id,
+    name: id,
+    activation: "auto",
+    package: "",
+  };
+}
+
+function makeDefaultModelInfo(providerID: Provider.ID, id: Model.ID): Model.Info {
+  return {
+    id,
+    modelID: id,
+    providerID,
+    name: id,
+    capabilities: {
+      tools: true,
+      input: ["text", "image"],
+      output: ["text"],
+    },
+    variants: [],
+    time: { released: 0 },
+    cost: [],
+    status: "active",
+    enabled: true,
+    limit: { context: 200_000, output: 32_000 },
+  };
+}
+
+function defineV2Plugin(plugin: Plugin.Plugin): Plugin.Plugin {
+  return plugin;
+}
 
 export interface BifrostAgyPluginOptions {
   /** Base URL of Central or Local Bifrost Gateway (e.g. "https://bifrost.example.internal" or "http://127.0.0.1:8080") */
@@ -62,7 +101,7 @@ interface ExternalCredentialOverrides {
 }
 
 const PLUGIN_ID = "opencode-bifrost-agy";
-const PLUGIN_VERSION = "2.0.0";
+const PLUGIN_VERSION = "2.0.1";
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const OPENCODE_ENV_CWD_RE = /<env>[\s\S]*?Working directory:\s*([^\r\n]+)[\s\S]*?<\/env>/;
@@ -1500,7 +1539,7 @@ function formatDoctorMarkdown(report: Record<string, unknown>): string {
  * Dual OpenCode V2 (`Plugin.define({ id, setup(ctx) })`) + OpenCode V1 (`server()`) default export.
  */
 export default {
-  ...Plugin.define({
+  ...defineV2Plugin({
     id: PLUGIN_ID,
     async setup(ctx) {
       const runtime = createBridgeRuntime(ctx.location.directory, ctx.options);
@@ -1604,8 +1643,8 @@ export default {
         });
       });
 
-      const bifrostProviderID = Provider.ID.make("bifrost");
-      const bifrostAgyProviderID = Provider.ID.make("bifrost-agy");
+      const bifrostProviderID = makeProviderID("bifrost");
+      const bifrostAgyProviderID = makeProviderID("bifrost-agy");
 
       const currentSource: {
         standardModels: Model.Info[];
@@ -1637,12 +1676,12 @@ export default {
         currentSource.discoveredAliases = inv.discoveredAliases;
 
         currentSource.standardModels = Object.entries(inv.standardModels).map(([id, name]) => ({
-          ...Model.Info.default(bifrostProviderID, Model.ID.make(id)),
+          ...makeDefaultModelInfo(bifrostProviderID, makeModelID(id)),
           name,
         }));
 
         currentSource.agyModels = Object.entries(inv.agyModels).map(([id, name]) => ({
-          ...Model.Info.default(bifrostAgyProviderID, Model.ID.make(id)),
+          ...makeDefaultModelInfo(bifrostAgyProviderID, makeModelID(id)),
           name,
           capabilities: {
             tools: true,
@@ -1665,8 +1704,8 @@ export default {
         if (st.vkDefault || currentSource.standardModels.length > 0) {
           editor.add({
             info: {
-              ...Provider.Info.empty(bifrostProviderID),
-              integrationID: Integration.ID.make("bifrost"),
+              ...makeEmptyProviderInfo(bifrostProviderID),
+              integrationID: makeIntegrationID("bifrost"),
               name: "Bifrost AI Gateway",
               activation: "enabled",
               package: "@opencode/ai/providers/openai-compatible",
@@ -1682,8 +1721,8 @@ export default {
 
         editor.add({
           info: {
-            ...Provider.Info.empty(bifrostAgyProviderID),
-            integrationID: Integration.ID.make("bifrost-agy"),
+            ...makeEmptyProviderInfo(bifrostAgyProviderID),
+            integrationID: makeIntegrationID("bifrost-agy"),
             name: "Antigravity CLI (Bifrost Policy + Gemini Enterprise Plugin)",
             activation: "enabled",
             package: "@opencode/ai/providers/openai-compatible",
@@ -1719,13 +1758,13 @@ export default {
       // 3. Register `agy` Agent
       await ctx.agent.transform((editor) => {
         editor.update("agy", (agent) => {
-          agent.name = Agent.Name.make("agy");
+          agent.name = makeAgentName("agy");
           agent.description = "Policy-governed Antigravity CLI agent via Gemini Enterprise (Zero-Daemon Plugin)";
           agent.mode = "all";
           agent.hidden = false;
           agent.model = {
             providerID: bifrostAgyProviderID,
-            id: Model.ID.make("agy-cli/policy-routed"),
+            id: makeModelID("agy-cli/policy-routed"),
           };
         });
       });
@@ -1737,12 +1776,12 @@ export default {
             name: cmdName,
             description,
             execute: async ({ sessionID, prompt, delivery }) => {
-              await ctx.session.switchAgent({ sessionID, agent: Agent.ID.make("agy") });
+              await ctx.session.switchAgent({ sessionID, agent: makeAgentID("agy") });
               await ctx.session.switchModel({
                 sessionID,
                 model: {
                   providerID: bifrostAgyProviderID,
-                  id: Model.ID.make(modelId),
+                  id: makeModelID(modelId),
                 },
               });
               await ctx.session.prompt({
