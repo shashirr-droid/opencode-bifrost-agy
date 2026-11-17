@@ -103,7 +103,7 @@ interface ExternalCredentialOverrides {
 }
 
 const PLUGIN_ID = "opencode-bifrost-agy";
-const PLUGIN_VERSION = "2.0.2";
+const PLUGIN_VERSION = "2.0.3";
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const OPENCODE_ENV_CWD_RE = /<env>[\s\S]*?Working directory:\s*([^\r\n]+)[\s\S]*?<\/env>/;
@@ -243,7 +243,7 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
   let modelCache: Record<string, string> = {};
   let modelCacheTs = 0;
   const vkAllowCache = new Map<string, { ts: number; allowed: Set<string> }>();
-  let policyRuleCache: { ts: number; model: string } = { ts: 0, model: "" };
+  let policyRulesCache: { ts: number; rules: any[] } = { ts: 0, rules: [] };
   let latestActiveOpencodeDir = resolve(initialDirectory);
 
   function applyCredentialOverrides(ext: ExternalCredentialOverrides = {}): void {
@@ -316,6 +316,7 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
           : "central-bifrost";
 
     vkAllowCache.clear();
+    policyRulesCache = { ts: 0, rules: [] };
   }
 
   applyCredentialOverrides();
@@ -507,42 +508,59 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
     }
   }
 
-  async function resolveCentralPolicyModel(catalog: Record<string, string>): Promise<string> {
+  async function fetchCentralRoutingRules(): Promise<any[]> {
     const now = Date.now();
-    if (policyRuleCache.model && now - policyRuleCache.ts < 60_000) {
-      return policyRuleCache.model;
+    if (policyRulesCache.rules.length > 0 && now - policyRulesCache.ts < 5_000) {
+      return policyRulesCache.rules;
     }
-    if (bifrostPolicyUser && bifrostPolicyPassword) {
-      try {
-        const basic = Buffer.from(`${bifrostPolicyUser}:${bifrostPolicyPassword}`).toString("base64");
-        const resp = await fetch(`${bifrostUrl}/api/routing/rules`, {
-          headers: { Authorization: `Basic ${basic}` },
-          signal: AbortSignal.timeout(5_000),
-        });
-        if (resp.ok) {
-          const raw: any = await resp.json();
-          const rules: any[] = Array.isArray(raw) ? raw : raw?.rules || raw?.data || [];
-          rules.sort((a, b) => Number(a?.priority ?? 100) - Number(b?.priority ?? 100));
-          for (const rule of rules) {
-            if (rule?.enabled !== false && String(rule?.cel_expression || "").includes("policy-routed")) {
-              const targetModel = String(rule?.targets?.[0]?.model || "").split("/").pop() || "";
-              if (targetModel) {
-                policyRuleCache = { ts: now, model: targetModel };
-                return targetModel;
-              }
-            }
-          }
+    if (!bifrostPolicyUser || !bifrostPolicyPassword) {
+      return [];
+    }
+    try {
+      const basic = Buffer.from(`${bifrostPolicyUser}:${bifrostPolicyPassword}`).toString("base64");
+      const resp = await fetch(`${bifrostUrl}/api/routing/rules`, {
+        headers: { Authorization: `Basic ${basic}` },
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (resp.ok) {
+        const raw: any = await resp.json();
+        const rules: any[] = Array.isArray(raw) ? raw : raw?.rules || raw?.data || [];
+        rules.sort((a: any, b: any) => Number(a?.priority ?? 100) - Number(b?.priority ?? 100));
+        policyRulesCache = { ts: now, rules };
+        return rules;
+      }
+    } catch {
+      // Fall back to local modelAliases or defaultAgyPolicyModel
+    }
+    return [];
+  }
+
+  async function resolveCentralPolicyModel(requestedSlug: string, catalog: Record<string, string>): Promise<string> {
+    const rules = await fetchCentralRoutingRules();
+    for (const rule of rules) {
+      if (rule?.enabled === false) continue;
+      const expr = String(rule?.cel_expression || "");
+      if (
+        expr.includes(`"${requestedSlug}"`) ||
+        expr.includes(`/${requestedSlug}"`) ||
+        expr.includes(`'${requestedSlug}'`) ||
+        expr.includes(`/${requestedSlug}'`)
+      ) {
+        const targetModel = String(rule?.targets?.[0]?.model || "").split("/").pop() || "";
+        if (targetModel) {
+          return targetModel;
         }
-      } catch {
-        // Fall through to configured defaultAgyPolicyModel or first discovered live model
       }
     }
-    if (defaultAgyPolicyModel && catalog[defaultAgyPolicyModel]) {
-      return defaultAgyPolicyModel;
+    if (requestedSlug === "policy-routed") {
+      if (defaultAgyPolicyModel && catalog[defaultAgyPolicyModel]) {
+        return defaultAgyPolicyModel;
+      }
+      const firstSlug = Object.keys(catalog)[0];
+      if (!firstSlug) throw new Error("No models available in live `agy models` catalog.");
+      return firstSlug;
     }
-    const firstSlug = Object.keys(catalog)[0];
-    if (!firstSlug) throw new Error("No models available in live `agy models` catalog.");
-    return firstSlug;
+    return "";
   }
 
   function buildFullPrompt(messages: any[], hasClientTools: boolean): string {
@@ -787,10 +805,11 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
             { status: vkCheck.status === 401 || vkCheck.status === 403 ? vkCheck.status : 502 }
           );
         }
-        const targetSlug =
-          requestedModel === "policy-routed"
-            ? await resolveCentralPolicyModel(catalog)
-            : configuredAliasTarget || requestedModel;
+        let targetSlug = requestedModel;
+        if (requestedModel === "policy-routed" || !catalog[requestedModel]) {
+          const centralTarget = await resolveCentralPolicyModel(requestedModel, catalog);
+          targetSlug = centralTarget || configuredAliasTarget || requestedModel;
+        }
         if (!vkCheck.allowed.has("*") && !vkCheck.allowed.has(targetSlug)) {
           return Response.json(
             { error: { message: `Model '${targetSlug}' denied by Central Bifrost Virtual Key policy.`, type: "BifrostPolicyError" } },
@@ -1160,7 +1179,7 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
     return Response.json({ error: { message: `Not found: ${path}` } }, { status: 404 });
   }
 
-  const desiredPort = resolvedRoutingMode === "through-bifrost" ? localBridgePort : 0;
+  const desiredPort = (resolvedRoutingMode as string) === "through-bifrost" ? localBridgePort : 0;
   let embeddedServer: ReturnType<typeof Bun.serve> | null = null;
   try {
     embeddedServer = Bun.serve({
@@ -1210,12 +1229,14 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
       let allowedSet: Set<string> | null = null;
       if (vkAgy) {
         const check = await validateCentralVirtualKey(vkAgy);
-        if (check.status === 200 && check.allowed.size > 0 && !check.allowed.has("*")) {
-          allowedSet = check.allowed;
+        if (check.status === 200 && check.allowed.size > 0) {
+          if (!check.allowed.has("*")) {
+            allowedSet = check.allowed;
+          }
           for (const slug of check.allowed) {
             if (!liveAgyCatalog[slug] && slug !== "policy-routed" && slug !== "*") {
               agyModels[`agy-cli/${slug}`] = `Antigravity CLI — Bifrost Alias '${slug}' (Gemini Enterprise)`;
-              if (slug.startsWith("agy-")) {
+              if (slug.startsWith("agy-") && !discoveredAliases.includes(slug)) {
                 discoveredAliases.push(slug);
               }
             }

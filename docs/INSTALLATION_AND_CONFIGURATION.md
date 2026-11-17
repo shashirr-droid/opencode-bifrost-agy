@@ -128,8 +128,8 @@ VK_OPENCODE_AGY=sk-bf-agy-<GENERATE_RANDOM_HEX_2>
 Merge [`examples/bifrost.config.example.json`](../examples/bifrost.config.example.json) into your Bifrost `config.json`:
 1. **`providers.vertex` / `providers.anthropic`:** Upstream providers used for default day-to-day OpenCode turns (`vk-opencode-default`).
 2. **`providers["agy-cli"]`:** Custom OpenAI-compatible provider cataloging your organization's approved `agy` CLI model slugs plus logical targets (`policy-routed`, `agy-frontier`, `agy-fast`, `agy-pro`).
-   - *Local Workstation Bifrost (`through-bifrost` mode):* `base_url` (`http://127.0.0.1:8091/v1` with `"allow_private_network": true`) forwards `/agy` calls directly into the embedded listener inside the `opencode-bifrost-agy` plugin.
-   - *Enterprise Central Bifrost (`central-bifrost` mode):* Central Bifrost never opens inbound connections to developer laptops; instead, the workstation plugin queries Central Bifrost's `GET /v1/models` and `/api/routing/rules` outbound over HTTPS to enforce Virtual Key allowlists and CEL rules before spawning `agy` locally.
+   - *Local Workstation Bifrost (`through-bifrost` mode):* `base_url` (`http://127.0.0.1:8091` with `"allow_private_network": true`) forwards `/agy` calls directly into the embedded listener inside the `opencode-bifrost-agy` plugin.
+   - *Enterprise Central Bifrost on Cloud Run / GKE (`central-bifrost` mode):* Set `base_url` to `"https://agy-local-workstation.invalid"` with `"allow_private_network": false`. Central Bifrost acts purely as a policy & catalog control plane and **never** opens inbound connections to developer workstations; instead, the workstation plugin queries Central Bifrost's `GET /v1/models` and `/api/routing/rules` outbound over HTTPS to enforce Virtual Key allowlists and CEL rules (`policy-routed` and tier aliases) before spawning `agy` locally.
 3. **`governance.virtual_keys`:**
    - `vk-opencode-default`: Grants access **only** to standard providers (`vertex`, `anthropic`)—preventing default coding turns from invoking Antigravity.
    - `vk-opencode-agy`: Grants scoped access to `agy-cli` and its approved model list.
