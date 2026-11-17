@@ -103,7 +103,7 @@ interface ExternalCredentialOverrides {
 }
 
 const PLUGIN_ID = "opencode-bifrost-agy";
-const PLUGIN_VERSION = "2.0.4";
+const PLUGIN_VERSION = "2.0.5";
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const OPENCODE_ENV_CWD_RE = /<env>[\s\S]*?Working directory:\s*([^\r\n]+)[\s\S]*?<\/env>/;
@@ -464,11 +464,13 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
     for (const rawLine of stdoutTxt.split(/\r?\n/)) {
       const clean = rawLine.replace(ANSI_RE, "").trim();
       if (!clean || clean.toLowerCase().startsWith("fetching ")) continue;
-      const parts = clean.includes("\t") ? clean.split("\t") : clean.split(/\s{2,}/);
-      if (parts.length >= 2) {
-        const slug = parts[0].trim();
-        const displayName = parts.slice(1).join(" ").trim();
-        if (SLUG_RE.test(slug)) parsed[slug] = displayName;
+      const m = /^([a-z0-9][a-z0-9._-]*)\s+(.+)$/.exec(clean);
+      if (m) {
+        const slug = m[1].trim();
+        const displayName = m[2].trim();
+        if (!["id", "model", "slug", "model_id"].includes(slug.toLowerCase()) && SLUG_RE.test(slug)) {
+          parsed[slug] = displayName;
+        }
       }
     }
     if (Object.keys(parsed).length === 0) {
@@ -576,6 +578,9 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
     const [rules, callerVkId] = await Promise.all([fetchCentralRoutingRules(), resolveCallerVkId(callerVk)]);
     for (const rule of rules) {
       if (rule?.enabled === false) continue;
+      const targetProvider = String(rule?.targets?.[0]?.provider || "agy-cli");
+      if (targetProvider !== "agy-cli") continue;
+
       const scope = String(rule?.scope || "global");
       const scopeId = String(rule?.scope_id || "");
       if (scope === "virtual_key") {
@@ -587,18 +592,21 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
       }
 
       const expr = String(rule?.cel_expression || "");
+      let headerMatched = false;
       if (expr.includes("headers[")) {
         const hdrMatch = /headers\[\s*["']([^"']+)["']\s*\]\s*==\s*["']([^"']+)["']/.exec(expr);
         if (!hdrMatch || (reqHeaders.get(hdrMatch[1]) || "") !== hdrMatch[2]) {
           continue;
         }
+        headerMatched = true;
       }
-      if (
+      const modelMatched =
         expr.includes(`"${requestedSlug}"`) ||
         expr.includes(`/${requestedSlug}"`) ||
         expr.includes(`'${requestedSlug}'`) ||
-        expr.includes(`/${requestedSlug}'`)
-      ) {
+        expr.includes(`/${requestedSlug}'`);
+
+      if (modelMatched || (headerMatched && !/\bmodel\s*==/.test(expr))) {
         const targetModel = String(rule?.targets?.[0]?.model || "").split("/").pop() || "";
         if (targetModel) {
           return targetModel;
@@ -858,11 +866,8 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
             { status: vkCheck.status === 401 || vkCheck.status === 403 ? vkCheck.status : 502 }
           );
         }
-        let targetSlug = requestedModel;
-        if (requestedModel === "policy-routed" || !catalog[requestedModel]) {
-          const centralTarget = await resolveCentralPolicyModel(requestedModel, catalog, callerVk, req.headers);
-          targetSlug = centralTarget || configuredAliasTarget || requestedModel;
-        }
+        const centralTarget = await resolveCentralPolicyModel(requestedModel, catalog, callerVk, req.headers);
+        const targetSlug = centralTarget || configuredAliasTarget || requestedModel;
         if (!vkCheck.allowed.has("*") && !vkCheck.allowed.has(targetSlug)) {
           return Response.json(
             { error: { message: `Model '${targetSlug}' denied by Central Bifrost Virtual Key policy.`, type: "BifrostPolicyError" } },
