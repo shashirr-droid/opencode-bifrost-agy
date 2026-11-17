@@ -103,7 +103,7 @@ interface ExternalCredentialOverrides {
 }
 
 const PLUGIN_ID = "opencode-bifrost-agy";
-const PLUGIN_VERSION = "2.0.3";
+const PLUGIN_VERSION = "2.0.4";
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const OPENCODE_ENV_CWD_RE = /<env>[\s\S]*?Working directory:\s*([^\r\n]+)[\s\S]*?<\/env>/;
@@ -508,6 +508,38 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
     }
   }
 
+  let vkValueToIdCache: { ts: number; map: Map<string, string> } = { ts: 0, map: new Map() };
+
+  async function resolveCallerVkId(callerVk: string): Promise<string> {
+    if (!callerVk || !bifrostPolicyUser || !bifrostPolicyPassword) return "";
+    const now = Date.now();
+    if (vkValueToIdCache.map.size > 0 && now - vkValueToIdCache.ts < 30_000) {
+      return vkValueToIdCache.map.get(callerVk) || "";
+    }
+    try {
+      const basic = Buffer.from(`${bifrostPolicyUser}:${bifrostPolicyPassword}`).toString("base64");
+      const resp = await fetch(`${bifrostUrl}/api/governance/virtual-keys`, {
+        headers: { Authorization: `Basic ${basic}` },
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (resp.ok) {
+        const raw: any = await resp.json();
+        const vks: any[] = Array.isArray(raw) ? raw : raw?.virtual_keys || raw?.data || [];
+        const m = new Map<string, string>();
+        for (const vk of vks) {
+          if (vk?.value && vk?.id) {
+            m.set(String(vk.value), String(vk.id));
+          }
+        }
+        vkValueToIdCache = { ts: now, map: m };
+        return m.get(callerVk) || "";
+      }
+    } catch {
+      // Non-fatal; global rules still evaluate cleanly
+    }
+    return "";
+  }
+
   async function fetchCentralRoutingRules(): Promise<any[]> {
     const now = Date.now();
     if (policyRulesCache.rules.length > 0 && now - policyRulesCache.ts < 5_000) {
@@ -535,11 +567,32 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
     return [];
   }
 
-  async function resolveCentralPolicyModel(requestedSlug: string, catalog: Record<string, string>): Promise<string> {
-    const rules = await fetchCentralRoutingRules();
+  async function resolveCentralPolicyModel(
+    requestedSlug: string,
+    catalog: Record<string, string>,
+    callerVk: string,
+    reqHeaders: Headers
+  ): Promise<string> {
+    const [rules, callerVkId] = await Promise.all([fetchCentralRoutingRules(), resolveCallerVkId(callerVk)]);
     for (const rule of rules) {
       if (rule?.enabled === false) continue;
+      const scope = String(rule?.scope || "global");
+      const scopeId = String(rule?.scope_id || "");
+      if (scope === "virtual_key") {
+        if (!callerVkId || scopeId !== callerVkId) continue;
+      } else if (scope === "provider") {
+        if (scopeId && scopeId !== "agy-cli") continue;
+      } else if (scope !== "global") {
+        continue;
+      }
+
       const expr = String(rule?.cel_expression || "");
+      if (expr.includes("headers[")) {
+        const hdrMatch = /headers\[\s*["']([^"']+)["']\s*\]\s*==\s*["']([^"']+)["']/.exec(expr);
+        if (!hdrMatch || (reqHeaders.get(hdrMatch[1]) || "") !== hdrMatch[2]) {
+          continue;
+        }
+      }
       if (
         expr.includes(`"${requestedSlug}"`) ||
         expr.includes(`/${requestedSlug}"`) ||
@@ -807,7 +860,7 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
         }
         let targetSlug = requestedModel;
         if (requestedModel === "policy-routed" || !catalog[requestedModel]) {
-          const centralTarget = await resolveCentralPolicyModel(requestedModel, catalog);
+          const centralTarget = await resolveCentralPolicyModel(requestedModel, catalog, callerVk, req.headers);
           targetSlug = centralTarget || configuredAliasTarget || requestedModel;
         }
         if (!vkCheck.allowed.has("*") && !vkCheck.allowed.has(targetSlug)) {
