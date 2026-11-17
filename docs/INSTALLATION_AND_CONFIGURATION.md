@@ -208,6 +208,7 @@ Parameters are resolved in priority order: **inline `opencode.json(c)` plugin `o
 | **`permissionMode`** | `AGY_PERMISSION_MODE` | `accept-edits` | `accept-edits` allows file edits inside the active repo while delegating shell commands & outside reads to OpenCode; `strict` delegates file writes too. |
 | **`routingMode`** | — | `auto` | `through-bifrost` when `bifrostUrl` is `localhost`/`127.0.0.1`; `central-bifrost` (ephemeral loopback port `0` + outbound HTTPS policy check) for remote URLs. |
 | **`defaultAgyPolicyModel`** | `CENTRAL_DEFAULT_AGY_MODEL` | First discovered `agy` model | Fallback concrete `agy` model in `central-bifrost` mode when `/api/routing/rules` is not exposed to workstations. |
+| **`modelAliases`** | — | `{}` | Optional map (`{ "agy-reasoning": "<AGY_MODEL_SLUG>" }`) registering additional selectable `/models` options and `/<alias>` slash commands in OpenCode. |
 | **`bifrostPolicyUser` / `Password`** | `BIFROST_POLICY_USER` / `PASSWORD` | — | Optional read-only Basic Auth credentials to poll Central Bifrost `/api/routing/rules` in `central-bifrost` mode. |
 | **`shimSharedSecret`** | `SHIM_SHARED_SECRET` | — | Optional shared token verified on `127.0.0.1:8091` when using local `through-bifrost` mode. |
 | **`allowedWorkspaceRoots`** | `AGY_ALLOWED_WORKSPACE_ROOTS` | `[$HOME, <project_dir>, "/tmp"]` | Allowed directory prefixes where `agy` may bind `cwd` and `--add-dir`. |

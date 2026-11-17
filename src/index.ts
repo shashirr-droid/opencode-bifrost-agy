@@ -57,6 +57,8 @@ export interface BifrostAgyPluginOptions {
   bifrostPolicyPassword?: string;
   /** Fallback concrete agy model slug when Central Bifrost rules API is not exposed to workstations */
   defaultAgyPolicyModel?: string;
+  /** Optional map of custom slash-command / model alias slugs (e.g. "agy-reasoning") -> live agy model slug */
+  modelAliases?: Record<string, string>;
   /** Default standard coding model in OpenCode (provider/model under bifrost) */
   defaultCodingModel?: string;
   /** Google Cloud Gemini Enterprise project ID (auto-detected from gcloud ADC quota_project_id if omitted) */
@@ -101,7 +103,7 @@ interface ExternalCredentialOverrides {
 }
 
 const PLUGIN_ID = "opencode-bifrost-agy";
-const PLUGIN_VERSION = "2.0.1";
+const PLUGIN_VERSION = "2.0.2";
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const OPENCODE_ENV_CWD_RE = /<env>[\s\S]*?Working directory:\s*([^\r\n]+)[\s\S]*?<\/env>/;
@@ -750,6 +752,10 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
       let catalog = await discoverAgyModels(false);
       const rawModel = String(body?.model || "").trim();
       let requestedModel = rawModel.includes("/") ? rawModel.split("/").pop()! : rawModel;
+      const configuredAliasTarget =
+        opts.modelAliases && typeof opts.modelAliases[requestedModel] === "string"
+          ? opts.modelAliases[requestedModel].trim()
+          : "";
 
       if (resolvedRoutingMode === "through-bifrost") {
         if (shimSharedSecret && bearerToken !== shimSharedSecret && req.headers.get("x-api-key") !== shimSharedSecret) {
@@ -757,6 +763,9 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
             { error: { message: "Unauthorized direct loopback call; route through Bifrost.", type: "PluginAuthError" } },
             { status: 401 }
           );
+        }
+        if (configuredAliasTarget) {
+          requestedModel = configuredAliasTarget;
         }
       } else {
         const callerVk = bearerToken || vkAgy;
@@ -779,8 +788,10 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
           );
         }
         const targetSlug =
-          requestedModel === "policy-routed" ? await resolveCentralPolicyModel(catalog) : requestedModel;
-        if (!vkCheck.allowed.has("*") && (!vkCheck.allowed.has(requestedModel) || !vkCheck.allowed.has(targetSlug))) {
+          requestedModel === "policy-routed"
+            ? await resolveCentralPolicyModel(catalog)
+            : configuredAliasTarget || requestedModel;
+        if (!vkCheck.allowed.has("*") && !vkCheck.allowed.has(targetSlug)) {
           return Response.json(
             { error: { message: `Model '${targetSlug}' denied by Central Bifrost Virtual Key policy.`, type: "BifrostPolicyError" } },
             { status: 403 }
@@ -1216,8 +1227,38 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
           agyModels[`agy-cli/${slug}`] = `Antigravity — ${displayName} (Gemini Enterprise)`;
         }
       }
+      if (opts.modelAliases && typeof opts.modelAliases === "object") {
+        for (const [rawAlias, rawTarget] of Object.entries(opts.modelAliases)) {
+          const alias = String(rawAlias || "").trim();
+          const target = String(rawTarget || "").trim();
+          if (!alias || !target) continue;
+          if (liveAgyCatalog[target] && (!allowedSet || allowedSet.has(target) || allowedSet.has(alias))) {
+            agyModels[`agy-cli/${alias}`] = `Antigravity — ${liveAgyCatalog[target]} [${alias}] (Gemini Enterprise)`;
+            if (!discoveredAliases.includes(alias)) {
+              discoveredAliases.push(alias);
+            }
+          } else if (!allowedSet || allowedSet.has(target) || allowedSet.has(alias)) {
+            agyModels[`agy-cli/${alias}`] = `Antigravity CLI — Alias '${alias}' -> '${target}' (Gemini Enterprise)`;
+            if (!discoveredAliases.includes(alias)) {
+              discoveredAliases.push(alias);
+            }
+          }
+        }
+      }
     } catch {
       // Keep policy-routed registered even before ADC login so /agy-doctor is always available
+      if (opts.modelAliases && typeof opts.modelAliases === "object") {
+        for (const [rawAlias, rawTarget] of Object.entries(opts.modelAliases)) {
+          const alias = String(rawAlias || "").trim();
+          const target = String(rawTarget || "").trim();
+          if (alias && target) {
+            agyModels[`agy-cli/${alias}`] = `Antigravity CLI — Alias '${alias}' -> '${target}' (Gemini Enterprise)`;
+            if (!discoveredAliases.includes(alias)) {
+              discoveredAliases.push(alias);
+            }
+          }
+        }
+      }
     }
 
     const agyBaseUrl =

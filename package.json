@@ -1,6 +1,6 @@
 {
   "name": "opencode-bifrost-agy",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "Zero-daemon, zero-dependency OpenCode V2 & V1 plugin integrating Bifrost AI Gateway, Google Antigravity CLI (agy), and Gemini Enterprise seats with implicit cache continuity and native OpenCode permission delegation.",
   "license": "Apache-2.0",
   "type": "module",
