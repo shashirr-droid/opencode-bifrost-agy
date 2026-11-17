@@ -103,7 +103,7 @@ interface ExternalCredentialOverrides {
 }
 
 const PLUGIN_ID = "opencode-bifrost-agy";
-const PLUGIN_VERSION = "2.0.5";
+const PLUGIN_VERSION = "2.0.6";
 const ANSI_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 const SLUG_RE = /^[a-z0-9][a-z0-9._-]*$/;
 const OPENCODE_ENV_CWD_RE = /<env>[\s\S]*?Working directory:\s*([^\r\n]+)[\s\S]*?<\/env>/;
@@ -624,6 +624,66 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
     return "";
   }
 
+  async function recordCentralBifrostTelemetry(params: {
+    callerVk: string;
+    reportSlug: string;
+    resolvedModel: string;
+    completionId: string;
+    created: number;
+    promptPreview: string;
+    responseText: string;
+    finishReason: string;
+    pTok: number;
+    cTok: number;
+    thinkingTok: number;
+    cachedTok: number;
+    tTok: number;
+    durationMs: number;
+    conversationId: string;
+    userAgent: string;
+  }): Promise<void> {
+    if ((resolvedRoutingMode as string) !== "central-bifrost" || !params.callerVk || !bifrostUrl) {
+      return;
+    }
+    try {
+      const receipt = {
+        v: 1,
+        completion_id: params.completionId,
+        created: params.created,
+        resolved_model: params.resolvedModel,
+        response_text: params.responseText.slice(0, 4000),
+        finish_reason: params.finishReason,
+        prompt_tokens: params.pTok,
+        completion_tokens: params.cTok,
+        thinking_tokens: params.thinkingTok,
+        cached_tokens: params.cachedTok,
+        total_tokens: params.tTok,
+        duration_ms: params.durationMs,
+        conversation_id: params.conversationId,
+      };
+      const b64 = Buffer.from(JSON.stringify(receipt), "utf8").toString("base64url");
+      await fetch(`${bifrostUrl}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${params.callerVk}`,
+          "Content-Type": "application/json",
+          "User-Agent": params.userAgent || "opencode/opencode-bifrost-agy",
+        },
+        body: JSON.stringify({
+          model: `agy-cli/${params.reportSlug}`,
+          stream: false,
+          messages: [
+            { role: "system", content: `AGY_EMPIRICAL_RECEIPT_V1:${b64}` },
+            { role: "user", content: params.promptPreview.slice(0, 4000) || "(agy turn)" },
+          ],
+        }),
+        signal: AbortSignal.timeout(5_000),
+      });
+    } catch {
+      // Non-fatal; never fail local developer workflow if central telemetry endpoint is transiently unreachable
+    }
+  }
+
   function buildFullPrompt(messages: any[], hasClientTools: boolean): string {
     const sysParts: string[] = [];
     const convoTurns: Array<[string, string]> = [];
@@ -831,6 +891,10 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
       let catalog = await discoverAgyModels(false);
       const rawModel = String(body?.model || "").trim();
       let requestedModel = rawModel.includes("/") ? rawModel.split("/").pop()! : rawModel;
+      const originalRequestedSlug = requestedModel;
+      let activeCallerVk = "";
+      let telemetryReportSlug = requestedModel;
+      const incomingUserAgent = req.headers.get("user-agent") || "opencode/opencode-bifrost-agy";
       const configuredAliasTarget =
         opts.modelAliases && typeof opts.modelAliases[requestedModel] === "string"
           ? opts.modelAliases[requestedModel].trim()
@@ -874,6 +938,11 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
             { status: 403 }
           );
         }
+        activeCallerVk = callerVk;
+        telemetryReportSlug =
+          vkCheck.allowed.has("*") || vkCheck.allowed.has(originalRequestedSlug)
+            ? originalRequestedSlug
+            : targetSlug;
         requestedModel = targetSlug;
       }
 
@@ -957,7 +1026,9 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
         }
         const usage = resultObj.usage || {};
         const pTok = Number(usage.input_tokens || 0);
-        const cTok = Number(usage.output_tokens || 0);
+        const rawOutTok = Number(usage.output_tokens || 0);
+        const thinkingTok = Number(usage.thinking_tokens || 0);
+        const cTok = rawOutTok + thinkingTok;
         const cachedTok = Number(usage.cache_read_tokens || 0);
         const tTok = Number(usage.total_tokens || pTok + cTok);
         const deniedActions = Array.isArray(resultObj.denied_actions) ? resultObj.denied_actions : [];
@@ -974,6 +1045,7 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
         );
         if (delegatedTc) {
           storeSession(workspaceDir, [...canonicalTurns, ["assistant_tc", delegatedTc.function.name]], convoId, nextTurn);
+          const durationMs = Date.now() - startedMs;
           auditRing.push({
             timestamp: new Date().toISOString(),
             runtime: "in-process-opencode-plugin",
@@ -984,17 +1056,41 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
             workspace_source: workspaceSource,
             delegated_tool_call: delegatedTc.function.name,
             status: "DELEGATED_TOOL_CALL",
-            duration_seconds: Number(((Date.now() - startedMs) / 1000).toFixed(3)),
+            duration_seconds: Number((durationMs / 1000).toFixed(3)),
             usage,
           });
           if (auditRing.length > 50) auditRing.shift();
+          await recordCentralBifrostTelemetry({
+            callerVk: activeCallerVk,
+            reportSlug: telemetryReportSlug,
+            resolvedModel: requestedModel,
+            completionId,
+            created,
+            promptPreview: prompt,
+            responseText: replyText || `[delegated tool_call: ${delegatedTc.function.name}]`,
+            finishReason: "tool_calls",
+            pTok,
+            cTok,
+            thinkingTok,
+            cachedTok,
+            tTok,
+            durationMs,
+            conversationId: convoId,
+            userAgent: incomingUserAgent,
+          });
           return Response.json({
             id: completionId,
             object: "chat.completion",
             created,
             model: requestedModel,
             choices: [{ index: 0, message: { role: "assistant", content: replyText || null, tool_calls: [delegatedTc] }, finish_reason: "tool_calls" }],
-            usage: { prompt_tokens: pTok, completion_tokens: cTok, total_tokens: tTok, prompt_tokens_details: { cached_tokens: cachedTok } },
+            usage: {
+              prompt_tokens: pTok,
+              completion_tokens: cTok,
+              total_tokens: tTok,
+              prompt_tokens_details: { cached_tokens: cachedTok },
+              completion_tokens_details: { reasoning_tokens: thinkingTok },
+            },
           });
         }
 
@@ -1004,6 +1100,7 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
         if (replyText.trim()) {
           storeSession(workspaceDir, [...canonicalTurns, ["assistant", replyText.trim()]], convoId, nextTurn);
         }
+        const durationMs = Date.now() - startedMs;
         auditRing.push({
           timestamp: new Date().toISOString(),
           runtime: "in-process-opencode-plugin",
@@ -1013,17 +1110,41 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
           workspace_dir: workspaceDir,
           workspace_source: workspaceSource,
           status: "SUCCESS",
-          duration_seconds: Number(((Date.now() - startedMs) / 1000).toFixed(3)),
+          duration_seconds: Number((durationMs / 1000).toFixed(3)),
           usage,
         });
         if (auditRing.length > 50) auditRing.shift();
+        await recordCentralBifrostTelemetry({
+          callerVk: activeCallerVk,
+          reportSlug: telemetryReportSlug,
+          resolvedModel: requestedModel,
+          completionId,
+          created,
+          promptPreview: prompt,
+          responseText: replyText,
+          finishReason: "stop",
+          pTok,
+          cTok,
+          thinkingTok,
+          cachedTok,
+          tTok,
+          durationMs,
+          conversationId: convoId,
+          userAgent: incomingUserAgent,
+        });
         return Response.json({
           id: completionId,
           object: "chat.completion",
           created,
           model: requestedModel,
           choices: [{ index: 0, message: { role: "assistant", content: replyText }, finish_reason: "stop" }],
-          usage: { prompt_tokens: pTok, completion_tokens: cTok, total_tokens: tTok, prompt_tokens_details: { cached_tokens: cachedTok } },
+          usage: {
+            prompt_tokens: pTok,
+            completion_tokens: cTok,
+            total_tokens: tTok,
+            prompt_tokens_details: { cached_tokens: cachedTok },
+            completion_tokens_details: { reasoning_tokens: thinkingTok },
+          },
         });
       }
 
@@ -1122,7 +1243,9 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
           }
 
           const pTok = Number(usageRaw.input_tokens || 0);
-          const cTok = Number(usageRaw.output_tokens || 0);
+          const rawOutTok = Number(usageRaw.output_tokens || 0);
+          const thinkingTok = Number(usageRaw.thinking_tokens || 0);
+          const cTok = rawOutTok + thinkingTok;
           const cachedTok = Number(usageRaw.cache_read_tokens || 0);
           const tTok = Number(usageRaw.total_tokens || pTok + cTok);
           const nextTurn = resumedEntry ? resumedEntry.turnCount + 1 : 1;
@@ -1147,6 +1270,7 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
                 nextTurn
               );
             }
+            const durationMs = Date.now() - startedMs;
             auditRing.push({
               timestamp: new Date().toISOString(),
               runtime: "in-process-opencode-plugin",
@@ -1157,10 +1281,28 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
               workspace_source: workspaceSource,
               delegated_tool_call: delegatedTc.function.name,
               status: "DELEGATED_TOOL_CALL",
-              duration_seconds: Number(((Date.now() - startedMs) / 1000).toFixed(3)),
+              duration_seconds: Number((durationMs / 1000).toFixed(3)),
               usage: usageRaw,
             });
             if (auditRing.length > 50) auditRing.shift();
+            await recordCentralBifrostTelemetry({
+              callerVk: activeCallerVk,
+              reportSlug: telemetryReportSlug,
+              resolvedModel: effModel || requestedModel,
+              completionId,
+              created,
+              promptPreview: prompt,
+              responseText: partialTxt || `[delegated tool_call: ${delegatedTc.function.name}]`,
+              finishReason: "tool_calls",
+              pTok,
+              cTok,
+              thinkingTok,
+              cachedTok,
+              tTok,
+              durationMs,
+              conversationId: convoId,
+              userAgent: incomingUserAgent,
+            });
             sendChunk({
               id: completionId,
               object: "chat.completion.chunk",
@@ -1174,7 +1316,13 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
               created,
               model: effModel,
               choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-              usage: { prompt_tokens: pTok, completion_tokens: cTok, total_tokens: tTok, prompt_tokens_details: { cached_tokens: cachedTok } },
+              usage: {
+                prompt_tokens: pTok,
+                completion_tokens: cTok,
+                total_tokens: tTok,
+                prompt_tokens_details: { cached_tokens: cachedTok },
+                completion_tokens_details: { reasoning_tokens: thinkingTok },
+              },
             });
             controller.enqueue(encoder.encode("data: [DONE]\n\n"));
             controller.close();
@@ -1197,6 +1345,7 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
           if (fullTxt) {
             storeSession(workspaceDir, [...canonicalTurns, ["assistant", fullTxt]], convoId, nextTurn);
           }
+          const durationMs = Date.now() - startedMs;
           auditRing.push({
             timestamp: new Date().toISOString(),
             runtime: "in-process-opencode-plugin",
@@ -1206,17 +1355,41 @@ function createBridgeRuntime(initialDirectory: string, rawOptions: Record<string
             workspace_dir: workspaceDir,
             workspace_source: workspaceSource,
             status: finalStatus,
-            duration_seconds: Number(((Date.now() - startedMs) / 1000).toFixed(3)),
+            duration_seconds: Number((durationMs / 1000).toFixed(3)),
             usage: usageRaw,
           });
           if (auditRing.length > 50) auditRing.shift();
+          await recordCentralBifrostTelemetry({
+            callerVk: activeCallerVk,
+            reportSlug: telemetryReportSlug,
+            resolvedModel: effModel || requestedModel,
+            completionId,
+            created,
+            promptPreview: prompt,
+            responseText: fullTxt,
+            finishReason: "stop",
+            pTok,
+            cTok,
+            thinkingTok,
+            cachedTok,
+            tTok,
+            durationMs,
+            conversationId: convoId,
+            userAgent: incomingUserAgent,
+          });
           sendChunk({
             id: completionId,
             object: "chat.completion.chunk",
             created,
             model: effModel,
             choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-            usage: { prompt_tokens: pTok, completion_tokens: cTok, total_tokens: tTok, prompt_tokens_details: { cached_tokens: cachedTok } },
+            usage: {
+              prompt_tokens: pTok,
+              completion_tokens: cTok,
+              total_tokens: tTok,
+              prompt_tokens_details: { cached_tokens: cachedTok },
+              completion_tokens_details: { reasoning_tokens: thinkingTok },
+            },
           });
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
