@@ -44,7 +44,7 @@
         }
       },
       "network_config": {
-        "base_url": "http://127.0.0.1:8091/v1",
+        "base_url": "http://127.0.0.1:8091",
         "allow_private_network": true,
         "default_request_timeout_in_seconds": 600
       },
@@ -56,6 +56,7 @@
           "weight": 1.0,
           "models": [
             "policy-routed",
+            "agy-default",
             "agy-frontier",
             "agy-fast",
             "agy-pro",
@@ -63,6 +64,7 @@
             "gemini-2.5-flash"
           ],
           "aliases": {
+            "agy-default": "gemini-2.5-flash",
             "agy-frontier": "gemini-2.5-pro",
             "agy-fast": "gemini-2.5-flash",
             "agy-pro": "gemini-2.5-pro"
@@ -113,6 +115,7 @@
             "weight": 1.0,
             "allowed_models": [
               "policy-routed",
+              "agy-default",
               "agy-frontier",
               "agy-fast",
               "agy-pro",
@@ -128,11 +131,28 @@
     ],
     "routing_rules": [
       {
+        "id": "rule-agy-fast-alias",
+        "name": "Fast /agy-fast Model Policy",
+        "enabled": true,
+        "chain_rule": false,
+        "cel_expression": "provider == \"agy-cli\" && (model == \"agy-fast\" || model == \"agy-cli/agy-fast\")",
+        "targets": [
+          {
+            "provider": "agy-cli",
+            "model": "gemini-2.5-flash",
+            "weight": 1.0
+          }
+        ],
+        "fallbacks": [],
+        "scope": "global",
+        "priority": 12
+      },
+      {
         "id": "rule-agy-global-default-model",
         "name": "Default /agy Model Policy",
         "enabled": true,
         "chain_rule": false,
-        "cel_expression": "model == \"policy-routed\" || model == \"agy-cli/policy-routed\"",
+        "cel_expression": "provider == \"agy-cli\" && (model == \"policy-routed\" || model == \"agy-cli/policy-routed\")",
         "targets": [
           {
             "provider": "agy-cli",

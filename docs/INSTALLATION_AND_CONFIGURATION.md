@@ -129,18 +129,18 @@ Merge [`examples/bifrost.config.example.json`](../examples/bifrost.config.exampl
 1. **`providers.vertex` / `providers.anthropic`:** Upstream providers used for default day-to-day OpenCode turns (`vk-opencode-default`).
 2. **`providers["agy-cli"]`:** Custom OpenAI-compatible provider cataloging your organization's approved `agy` CLI model slugs plus logical targets (`policy-routed`, `agy-frontier`, `agy-fast`, `agy-pro`).
    - *Local Workstation Bifrost (`through-bifrost` mode):* `base_url` (`http://127.0.0.1:8091` with `"allow_private_network": true`) forwards `/agy` calls directly into the embedded listener inside the `opencode-bifrost-agy` plugin.
-   - *Enterprise Central Bifrost on Cloud Run / GKE (`central-bifrost` mode):* Set `base_url` to `"https://agy-local-workstation.invalid"` with `"allow_private_network": false`. Central Bifrost acts purely as a policy & catalog control plane and **never** opens inbound connections to developer workstations; instead, the workstation plugin queries Central Bifrost's `GET /v1/models` and `/api/routing/rules` outbound over HTTPS to enforce Virtual Key allowlists and CEL rules (`policy-routed` and tier aliases) before spawning `agy` locally.
+   - *Enterprise Central Bifrost on Cloud Run / GKE (`central-bifrost` mode):* Deploy Central Bifrost with the co-located container-internal [`deploy/cloudrun/receipt_bridge.py`](../deploy/cloudrun/README.md) (`base_url: "http://127.0.0.1:8091"`, `"allow_private_network": true` inside the Cloud Run container). Central Bifrost **never** opens inbound connections to developer workstations; instead, the workstation plugin queries Central Bifrost's `GET /v1/models` and `/api/routing/rules` outbound over HTTPS before spawning `agy` locally, and posts the verbatim empirical `agy` token receipt back to Central Bifrost so all Dashboard charts (`Provider Usage`, `Model Rankings`, `Virtual Key Rankings`, `Logs`) stay populated in real time.
 3. **`governance.virtual_keys`:**
    - `vk-opencode-default`: Grants access **only** to standard providers (`vertex`, `anthropic`)—preventing default coding turns from invoking Antigravity.
    - `vk-opencode-agy`: Grants scoped access to `agy-cli` and its approved model list.
 4. **`governance.routing_rules` (`rule-agy-global-default-model`):**
-   - Evaluates `model == "policy-routed" || model == "agy-cli/policy-routed"` and rewrites it to your chosen default `agy` model (e.g., `gemini-2.5-flash` or `gemini-2.5-pro`).
+   - Evaluates `provider == "agy-cli" && (model == "policy-routed" || model == "agy-cli/policy-routed")` and rewrites it to your chosen default `agy` model (e.g., `gemini-2.5-flash` or `gemini-2.5-pro`). Always include `provider == "agy-cli"` (and `provider == "vertex"` on Vertex rules) so shared model slugs never collide across providers.
 
 ---
 
 ## 5. Step 4: Install & Configure the `opencode-bifrost-agy` Plugin in OpenCode
 
-The `opencode-bifrost-agy` plugin (`v2.0.0`) exports both OpenCode V2's `Plugin.define({ id: "opencode-bifrost-agy", setup(ctx) })` contract and OpenCode V1's `server()` hook, running **in-process inside OpenCode's Bun runtime** with zero external daemons.
+The `opencode-bifrost-agy` plugin (`v2.0.6`) exports both OpenCode V2's `{ id: "opencode-bifrost-agy", setup(ctx) }` contract and OpenCode V1's `server()` hook, running **in-process inside OpenCode's Bun runtime** with zero external daemons and zero runtime npm dependencies.
 
 ### Option A: One-Command Install + Interactive Login (`opencode plugin add` + `/connect`)
 
