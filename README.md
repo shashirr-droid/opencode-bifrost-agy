@@ -42,6 +42,11 @@ opencode
 
 *(Using OpenCode V1 `1.19.x`? Install via `opencode plugin github:shashirr-droid/opencode-bifrost-agy -g` and run `opencode auth login`.)*
 
+> [!TIP]
+> **Which Security Keys Do I Need? (Developer vs. Gateway Admin)**
+> - **Developers (Per Workstation — Zero Key Generation):** You do **not** generate any secrets. Run `gcloud auth application-default login` once (for your personal Gemini Enterprise seat) and paste the **`/agy` Virtual Key (`sk-bf-agy-...`)**—plus optional **Standard Virtual Key (`sk-bf-std-...`)**—issued by your Bifrost Admin when prompted by `opencode auth login bifrost-agy`.
+> - **Bifrost Gateway Admins (One-Time Setup):** Create Virtual Keys in **1 click** inside the Bifrost Web UI (**Governance &rarr; Virtual Keys &rarr; + Create Virtual Key**) or auto-generate all gateway secrets in one copy-paste command—see **[Step 3: Create Security Keys & Configure Bifrost](docs/INSTALLATION_AND_CONFIGURATION.md#4-step-3-create-security-keys--configure-bifrost-admin-one-time)**.
+
 Inside OpenCode:
 - **Normal prompt (`Enter`):** Uses your standard Bifrost model (`vertex/*`, `anthropic/*`) with zero `agy` seat usage.
 - **`/agy <task>`:** Switches to the `agy` agent and executes via Antigravity CLI under Bifrost's active `policy-routed` model policy.
@@ -54,10 +59,10 @@ Inside OpenCode:
 
 | Document / Folder | Contents |
 | :--- | :--- |
-| **[Installation & Configuration Guide](docs/INSTALLATION_AND_CONFIGURATION.md)** | Step-by-step setup across **Google Cloud Gemini Enterprise**, **Antigravity CLI (`agy`)**, **100% Stock Bifrost AI Gateway** (Cloud Run / GKE or localhost), **OpenCode V2 & V1 Plugin installation**, **Requisite Parameters Reference**, and **Troubleshooting**. |
+| **[Installation & Configuration Guide](docs/INSTALLATION_AND_CONFIGURATION.md)** | Step-by-step setup across **Google Cloud Gemini Enterprise**, **Antigravity CLI (`agy`)**, **Simplified 1-Click / 1-Command Security Key Setup**, **100% Stock Bifrost AI Gateway**, **OpenCode V2 & V1 Plugin**, and **Troubleshooting**. |
 | **[Architecture & Request / Telemetry Data Flows](docs/ARCHITECTURE_AND_DATA_FLOW.md)** | Split-plane trust boundaries (`central-bifrost` vs. `through-bifrost`), **Standard Request Flow**, the 6-stage **Agentic `/agy` Coding Task Flow**, and how **unmodified Central Bifrost** records remote workstation `agy` telemetry via an external stateless `base_url`. |
-| **[Stateless Receipt Echo Service (`deploy/receipt-echo-service/`)](deploy/receipt-echo-service/README.md)** | Standalone ~100-line stateless Cloud Run function (`agy-receipt-echo`) configured as `providers["agy-cli"].network_config.base_url` so **Central Bifrost requires zero custom code or sidecars**. |
-| **[Stock Central Bifrost Cloud Run Bundle (`deploy/cloudrun/`)](deploy/cloudrun/README.md)** | Pure stock `bifrost-http` `Dockerfile` & `entrypoint.sh` for Google Cloud Run (plus an optional co-located loopback alternative). |
+| **[Stateless Receipt Echo Service (`deploy/receipt-echo-service/`)](deploy/receipt-echo-service/README.md)** | Standalone ~100-line stateless Cloud Run function (`agy-receipt-echo`) with copy-paste Secret Manager setup so **Central Bifrost requires zero custom code or sidecars**. |
+| **[Stock Central Bifrost Cloud Run Bundle (`deploy/cloudrun/`)](deploy/cloudrun/README.md)** | Pure stock `bifrost-http` `Dockerfile`, `entrypoint.sh`, and one-shot Secret Manager key generator for Google Cloud Run. |
 | **[Example Config Templates (`examples/`)](examples/)** | Sanitized ready-to-adapt templates: [`bifrost.env.example`](examples/bifrost.env.example), [`bifrost.config.example.json`](examples/bifrost.config.example.json), and [`opencode.json.example`](examples/opencode.json.example). |
 
 ---

@@ -12,8 +12,8 @@ This guide walks platform administrators and developers through installing and c
 1. [Prerequisites Overview](#1-prerequisites-overview)
 2. [Step 1: Configure Google Cloud & Gemini Enterprise](#2-step-1-configure-google-cloud--gemini-enterprise)
 3. [Step 2: Install Antigravity CLI (`agy`) & Human User ADC](#3-step-2-install-antigravity-cli-agy--human-user-adc)
-4. [Step 3: Configure the Bifrost AI Gateway (Central or Local)](#4-step-3-configure-the-bifrost-ai-gateway-central-or-local)
-5. [Step 4: Install & Configure the `opencode-bifrost-agy` Plugin in OpenCode](#5-step-4-install--configure-the-opencode-bifrost-agy-plugin-in-opencode)
+4. [Step 3: Create Security Keys & Configure Bifrost (Admin One-Time)](#4-step-3-create-security-keys--configure-bifrost-admin-one-time)
+5. [Step 4: Install & Configure the `opencode-bifrost-agy` Plugin in OpenCode (Developer)](#5-step-4-install--configure-the-opencode-bifrost-agy-plugin-in-opencode-developer)
 6. [Step 5: Requisite Parameters Reference](#6-step-5-requisite-parameters-reference)
 7. [Step 6: Verification, Day-to-Day Usage & Day-2 Operations](#7-step-6-verification-day-to-day-usage--day-2-operations)
 8. [Troubleshooting Runbook](#8-troubleshooting-runbook)
@@ -106,43 +106,111 @@ BAICODE_USER_TIER="${BAICODE_USER_TIER}" \
 
 ---
 
-## 4. Step 3: Configure the Bifrost AI Gateway (Central or Local)
+## 4. Step 3: Create Security Keys & Configure Bifrost (Admin One-Time)
 
 Bifrost serves as the centralized policy control plane—enforcing **Virtual Key RBAC** (separating standard LLM access from `/agy` access), **model allowlists**, **tier aliases**, and **CEL routing rules** (`policy-routed`).
 
-### 4.1 Create `/etc/bifrost/bifrost.env`
+### 4.1 Security Keys At-a-Glance (Who Creates vs. Who Uses What?)
 
-Copy [`examples/bifrost.env.example`](../examples/bifrost.env.example) to `/etc/bifrost/bifrost.env` (`chmod 0600`) and populate your Virtual Keys:
+> [!IMPORTANT]
+> **Developers DO NOT generate random secrets.** A Gateway Admin creates the infrastructure secrets once and issues only **Virtual Keys (`sk-bf-...`)** to developers.
 
-```ini
-VERTEX_PROJECT_ID=<YOUR_VERTEX_GCP_PROJECT_ID>
-ANTHROPIC_API_KEY=<YOUR_ANTHROPIC_API_KEY_OPTIONAL>
-SHIM_SHARED_SECRET=<GENERATE_RANDOM_HEX_SECRET>
-
-VK_OPENCODE_DEFAULT=sk-bf-std-<GENERATE_RANDOM_HEX_1>
-VK_OPENCODE_AGY=sk-bf-agy-<GENERATE_RANDOM_HEX_2>
-```
-
-### 4.2 Merge Provider, Virtual Keys & CEL Rule into `config.json`
-
-Merge [`examples/bifrost.config.example.json`](../examples/bifrost.config.example.json) into your Bifrost `config.json`:
-1. **`providers.vertex` / `providers.anthropic`:** Upstream providers used for default day-to-day OpenCode turns (`vk-opencode-default`).
-2. **`providers["agy-cli"]`:** Custom OpenAI-compatible provider cataloging your organization's approved `agy` CLI model slugs plus logical targets (`policy-routed`, `agy-frontier`, `agy-fast`, `agy-pro`).
-   - *Local Workstation Bifrost (`through-bifrost` mode):* `base_url` (`http://127.0.0.1:8091` with `"allow_private_network": true`) forwards `/agy` calls directly into the embedded listener inside the `opencode-bifrost-agy` plugin.
-   - *Enterprise Central Bifrost on Cloud Run / GKE (`central-bifrost` mode — Zero Changes Inside Central Bifrost):* Keep Central Bifrost **100% stock and unmodified**, deploy the standalone stateless [`deploy/receipt-echo-service/`](../deploy/receipt-echo-service/README.md) on Cloud Run, and set `providers["agy-cli"].network_config` in Bifrost to `"base_url": "https://agy-receipt-echo-<HASH>-uc.a.run.app"` (`"allow_private_network": false`). Central Bifrost **never** opens inbound connections to developer workstations; instead, the workstation plugin queries Central Bifrost's `GET /v1/models` and `/api/routing/rules` outbound over HTTPS before spawning `agy` locally, and posts the verbatim empirical `agy` token receipt back to Central Bifrost so all Dashboard charts (`Provider Usage`, `Model Rankings`, `Virtual Key Rankings`, `Logs`) stay populated in real time. *(An optional single-container co-located `receipt_bridge.py` bundle is also available under [`deploy/cloudrun/`](../deploy/cloudrun/README.md)).*
-3. **`governance.virtual_keys`:**
-   - `vk-opencode-default`: Grants access **only** to standard providers (`vertex`, `anthropic`)—preventing default coding turns from invoking Antigravity.
-   - `vk-opencode-agy`: Grants scoped access to `agy-cli` and its approved model list.
-4. **`governance.routing_rules` (`rule-agy-global-default-model`):**
-   - Evaluates `provider == "agy-cli" && (model == "policy-routed" || model == "agy-cli/policy-routed")` and rewrites it to your chosen default `agy` model (e.g., `gemini-2.5-flash` or `gemini-2.5-pro`). Always include `provider == "agy-cli"` (and `provider == "vertex"` on Vertex rules) so shared model slugs never collide across providers.
+| Key / Credential | Created By | Used By | Purpose | How to Create |
+| :--- | :--- | :--- | :--- | :--- |
+| **`vkAgy` (`sk-bf-agy-...`)** | Bifrost Admin *(once per team or user)* | **Developer** *(paste into `opencode auth login bifrost-agy`)* | Authorizes `/agy` models, CEL routing, and Dashboard telemetry in Bifrost. | **1 click** in Bifrost UI (**Governance &rarr; Virtual Keys**) *or* `sk-bf-agy-$(openssl rand -hex 16)` |
+| **`vkDefault` (`sk-bf-std-...`)** *(Optional)* | Bifrost Admin *(once per team or user)* | **Developer** *(paste into `opencode auth login bifrost-agy`)* | Authorizes standard non-`/agy` prompts (`vertex/*`, `anthropic/*`) while blocking `/agy`. | **1 click** in Bifrost UI (**Governance &rarr; Virtual Keys**) *or* `sk-bf-std-$(openssl rand -hex 16)` |
+| **Human GCP ADC** | **Developer** *(on own workstation)* | **Local `agy` CLI** | Authenticates personal Gemini Enterprise seat (`authorized_user`). | `gcloud auth application-default login` *(Step 2 above — no key file to copy)* |
+| **`SHIM_SHARED_SECRET`** *(Admin Only)* | Bifrost Admin *(one-time)* | **Bifrost &harr; `agy-receipt-echo` only** *(never shared with developers)* | Authenticates Central Bifrost when forwarding receipts to `agy-receipt-echo` (or local `:8091`). | `openssl rand -hex 24` |
+| **`BIFROST_ADMIN_PASSWORD`** *(Admin Only)* | Bifrost Admin *(one-time)* | **Bifrost Admin UI** *(never shared with developers)* | Protects Bifrost Web Dashboard (`https://.../`) & `/api/*` admin endpoints. | `openssl rand -base64 18` |
 
 ---
 
-## 5. Step 4: Install & Configure the `opencode-bifrost-agy` Plugin in OpenCode
+### 4.2 Choose One Key Setup Method
+
+Pick **whichever single path** matches how you run Bifrost—no manual `<GENERATE_RANDOM_HEX>` editing required:
+
+#### Path A (Simplest): Existing Central Bifrost Web UI (1-Click Virtual Keys, Zero Config Edits)
+
+If you already run an unmodified Central Bifrost instance (on GKE, Cloud Run, ECS, or a VM):
+
+1. **Deploy the external receipt echo service (1 secret):** Follow **[`deploy/receipt-echo-service/README.md`](../deploy/receipt-echo-service/README.md)**—its Step 1 generates `SHIM_SECRET="$(openssl rand -hex 24)"` and prints the value + `https://agy-receipt-echo-...` URL.
+2. **Register the `agy-cli` Custom Provider in Bifrost UI:**
+   - Open your Bifrost Dashboard &rarr; **Providers &rarr; + Add Custom Provider**.
+   - **Name:** `agy-cli` | **Base Provider Type:** `OpenAI` | **Base URL:** `https://agy-receipt-echo-<HASH>-uc.a.run.app` *(leave `Allow Private Network` **OFF**)*.
+   - **API Key:** Paste `${SHIM_SECRET}` from step 1.
+   - **Models:** Add `policy-routed`, `agy-default`, `agy-fast`, `agy-frontier`, `agy-pro`, plus your organization's approved `agy` model slugs.
+3. **Create Developer Virtual Keys in 1 Click:**
+   - Go to **Governance &rarr; Virtual Keys &rarr; + Create Virtual Key**:
+     - **Key 1 (`/agy` Key — Required):** Name `vk-opencode-agy` &rarr; allow provider **`agy-cli`** &rarr; click **Create** &rarr; copy the auto-generated `sk-bf-...` token.
+     - **Key 2 (Standard Key — Optional):** Name `vk-opencode-default` &rarr; allow providers **`vertex` / `anthropic`** *(exclude `agy-cli`)* &rarr; click **Create** &rarr; copy the auto-generated `sk-bf-...` token.
+4. **Hand Off to Developers:** Share **only** your Central Bifrost URL and the copied `sk-bf-...` Virtual Key(s) with developers for Step 4 below.
+
+#### Path B: New Central Bifrost on Google Cloud Run (One Copy-Paste Secret Manager Script)
+
+If deploying Central Bifrost from scratch on Google Cloud Run, run the **single copy-paste block in [`deploy/cloudrun/README.md` (Step 1)](../deploy/cloudrun/README.md#step-1-auto-generate-all-4-keys-in-google-cloud-secret-manager-one-copy-paste-block)**—it automatically generates `BIFROST_ADMIN_PASSWORD`, `SHIM_SHARED_SECRET`, `VK_OPENCODE_DEFAULT`, and `VK_OPENCODE_AGY` via `openssl`, stores them in Google Cloud Secret Manager, binds IAM permissions, and prints the two developer Virtual Keys on screen.
+
+#### Path C: Local Workstation or Single-VM Bifrost (`/etc/bifrost/bifrost.env` One-Shot Generator)
+
+If running Bifrost locally (`http://127.0.0.1:8080`) or on a Linux VM via `/etc/bifrost/bifrost.env`, run this single copy-paste block to auto-generate all keys and render `/etc/bifrost/config.json` with `0600` permissions:
+
+```bash
+export VERTEX_PROJECT_ID="<YOUR_VERTEX_GCP_PROJECT_ID>"
+
+sudo install -d -m 0750 /etc/bifrost
+ADMIN_PW="$(openssl rand -base64 18)"
+SHIM_SECRET="$(openssl rand -hex 24)"
+VK_STD="sk-bf-std-$(openssl rand -hex 16)"
+VK_AGY="sk-bf-agy-$(openssl rand -hex 16)"
+
+sudo tee /etc/bifrost/bifrost.env >/dev/null <<EOF
+VERTEX_PROJECT_ID=${VERTEX_PROJECT_ID}
+BIFROST_ADMIN_PASSWORD=${ADMIN_PW}
+SHIM_SHARED_SECRET=${SHIM_SECRET}
+VK_OPENCODE_DEFAULT=${VK_STD}
+VK_OPENCODE_AGY=${VK_AGY}
+EOF
+sudo chmod 0600 /etc/bifrost/bifrost.env
+
+# Substitute Virtual Keys into config.json (for local through-bifrost mode, set base_url to http://127.0.0.1:8091 & allow_private_network: true)
+sed \
+  -e "s|__VK_OPENCODE_DEFAULT__|${VK_STD}|g" \
+  -e "s|__VK_OPENCODE_AGY__|${VK_AGY}|g" \
+  examples/bifrost.config.example.json | sudo tee /etc/bifrost/config.json >/dev/null
+sudo chmod 0600 /etc/bifrost/config.json
+
+cat <<EOF
+
+=========================================================================
+KEYS GENERATED (/etc/bifrost/bifrost.env):
+  [Admin Only] Bifrost UI Login      : admin / ${ADMIN_PW}
+  [Local Mode] SHIM_SHARED_SECRET    : ${SHIM_SECRET}
+  [Paste in OpenCode] Standard VK    : ${VK_STD}
+  [Paste in OpenCode] /agy VK        : ${VK_AGY}
+=========================================================================
+EOF
+```
+
+---
+
+### 4.3 Summary of What `bifrost.config.example.json` Configures
+
+Whether configured via the Bifrost UI (Path A) or [`examples/bifrost.config.example.json`](../examples/bifrost.config.example.json) (Paths B & C):
+1. **`providers.vertex` / `providers.anthropic`:** Upstream providers used for default day-to-day OpenCode turns (`vk-opencode-default`).
+2. **`providers["agy-cli"]`:** Custom OpenAI-compatible provider cataloging your organization's approved `agy` CLI model slugs plus logical targets (`policy-routed`, `agy-frontier`, `agy-fast`, `agy-pro`).
+   - *Enterprise Central Bifrost (`central-bifrost` mode — Zero Changes Inside Central Bifrost):* Set `"base_url": "https://agy-receipt-echo-<HASH>-uc.a.run.app"` and `"allow_private_network": false` (pointing to [`deploy/receipt-echo-service/`](../deploy/receipt-echo-service/README.md)). Central Bifrost **never** opens inbound connections to developer workstations; the workstation plugin queries `/v1/models` & `/api/routing/rules` outbound over HTTPS before spawning `agy` locally, then posts the verbatim empirical `agy` token receipt back so all Dashboard charts stay populated in real time.
+   - *Local Workstation Bifrost (`through-bifrost` mode):* Set `"base_url": "http://127.0.0.1:8091"` with `"allow_private_network": true` (and export `SHIM_SHARED_SECRET` or pass `shimSharedSecret` if enforcing loopback bearer auth).
+3. **`governance.virtual_keys`:** `vk-opencode-default` grants access **only** to standard providers (`vertex`, `anthropic`), while `vk-opencode-agy` grants scoped access to `agy-cli` and its approved model list.
+4. **`governance.routing_rules` (`rule-agy-global-default-model`):** Evaluates `provider == "agy-cli" && (model == "policy-routed" || model == "agy-cli/policy-routed")` and rewrites it to your chosen default `agy` model (e.g., `gemini-2.5-flash` or `gemini-2.5-pro`). Always include `provider == "agy-cli"` (and `provider == "vertex"` on Vertex rules) so shared model slugs never collide across providers.
+
+---
+
+## 5. Step 4: Install & Configure the `opencode-bifrost-agy` Plugin in OpenCode (Developer)
 
 The `opencode-bifrost-agy` plugin (`v2.0.6`) exports both OpenCode V2's `{ id: "opencode-bifrost-agy", setup(ctx) }` contract and OpenCode V1's `server()` hook, running **in-process inside OpenCode's Bun runtime** with zero external daemons and zero runtime npm dependencies.
 
 ### Option A: One-Command Install + Interactive Login (`opencode plugin add` + `/connect`)
+
+Have the **Bifrost Gateway URL** and the **`/agy` Virtual Key (`sk-bf-agy-...`)** (plus optional **Standard Virtual Key (`sk-bf-std-...`)**) from your Bifrost Admin handy, then run:
 
 ```bash
 # 1. Install the plugin globally into OpenCode V2
@@ -157,14 +225,14 @@ opencode auth login bifrost-agy
 
 *(Using OpenCode V1 `1.19.x`? Run `opencode plugin github:shashirr-droid/opencode-bifrost-agy -g` followed by `opencode auth login`.)*
 
-Answer the form prompts when connecting **`Antigravity CLI (Bifrost Policy + Gemini Enterprise)`** (`bifrost-agy`):
+Enter the values when prompted by **`Antigravity CLI (Bifrost Policy + Gemini Enterprise)`** (`bifrost-agy`):
 1. **Bifrost Gateway URL:** `https://bifrost.example.internal` *(or `http://127.0.0.1:8080` for local Bifrost)*
-2. **Bifrost Standard Virtual Key:** `sk-bf-std-...` *(optional, for default non-`/agy` coding turns)*
-3. **Gemini Enterprise GCP Quota Project ID:** *(auto-suggested from your `application_default_credentials.json`)*
+2. **Bifrost Standard Virtual Key (`vkDefault`):** Paste **`sk-bf-std-...`** *(optional — used for normal non-`/agy` coding turns)*
+3. **Gemini Enterprise GCP Quota Project ID:** *(press `Enter` to accept the value auto-detected from your `application_default_credentials.json`)*
 4. **Gemini Enterprise Location:** `global` | `us` | `eu`
 5. **Gemini Enterprise License Tier:** `gcp-ge-plus-tier` | `gcp-ge-standard-tier`
 6. **Headless Workspace Permission Posture:** `accept-edits` *(recommended)* | `strict`
-7. **API Key (`/agy` Virtual Key):** `sk-bf-agy-...`
+7. **API Key (`/agy` Virtual Key — `vkAgy`):** Paste **`sk-bf-agy-...`** *(required — authorizes `/agy` models & telemetry)*
 
 OpenCode V2 stores the credential and form metadata securely in its SQLite credential database (`~/.local/share/opencode/opencode.db`) and automatically reloads the `bifrost` and `bifrost-agy` model catalogs without restarting OpenCode.
 

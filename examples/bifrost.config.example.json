@@ -1,4 +1,9 @@
 {
+  "auth_config": {
+    "is_enabled": true,
+    "admin_username": "admin",
+    "admin_password": "env.BIFROST_ADMIN_PASSWORD"
+  },
   "client": {
     "enforce_auth_on_inference": true
   },
@@ -44,9 +49,9 @@
         }
       },
       "network_config": {
-        "base_url": "http://127.0.0.1:8091",
-        "allow_private_network": true,
-        "default_request_timeout_in_seconds": 600
+        "base_url": "https://agy-receipt-echo-example.a.run.app",
+        "allow_private_network": false,
+        "default_request_timeout_in_seconds": 30
       },
       "keys": [
         {
@@ -78,7 +83,7 @@
       {
         "id": "vk-opencode-default",
         "name": "OpenCode Standard Key (No Antigravity)",
-        "value": "env.VK_OPENCODE_DEFAULT",
+        "value": "__VK_OPENCODE_DEFAULT__",
         "is_active": true,
         "provider_configs": [
           {
@@ -107,7 +112,7 @@
       {
         "id": "vk-opencode-agy",
         "name": "OpenCode /agy Key (Gemini Enterprise)",
-        "value": "env.VK_OPENCODE_AGY",
+        "value": "__VK_OPENCODE_AGY__",
         "is_active": true,
         "provider_configs": [
           {
